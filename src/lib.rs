@@ -3,3 +3,4 @@
 #![feature(allocator_api)]
 
 pub mod buddy_allocator;
+pub mod merkle_tree;
