@@ -223,3 +223,121 @@ mod imp {
 
 #[cfg(feature = "std")]
 pub use imp::*;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An allocator whose methods must never be called; used by tests that
+    /// only exercise `empty`/`leaf_node`, neither of which ever touches `A`.
+    struct NullAllocator;
+
+    impl MerkleTreeNodeAllocator for NullAllocator {
+        fn allocate() -> Result<NonNull<MerkleTreeNode>, AllocError> {
+            unreachable!("NullAllocator never allocates");
+        }
+
+        unsafe fn deallocate(_node: NonNull<MerkleTreeNode>) {
+            unreachable!("NullAllocator never deallocates");
+        }
+    }
+
+    /// Turn a bare address into the `NonNull<c_void>` this module's API
+    /// expects; the address is never dereferenced, only compared.
+    fn ptr(addr: usize) -> NonNull<c_void> {
+        NonNull::new(addr as *mut c_void).unwrap()
+    }
+
+    #[test]
+    #[should_panic(expected = "power of two")]
+    fn empty_panics_on_non_power_of_two_size() {
+        MerkleTree::<NullAllocator>::empty(ptr(0x1000), 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "power of two")]
+    fn empty_panics_on_non_power_of_two_ptr() {
+        MerkleTree::<NullAllocator>::empty(ptr(0x1001), 0x100);
+    }
+
+    #[test]
+    fn leaf_node_on_empty_tree_is_always_none() {
+        let mut tree = MerkleTree::<NullAllocator>::empty(ptr(0x1000), 0x100);
+
+        // In range, but no nodes have been linked yet.
+        assert!(tree.leaf_node(ptr(0x1000)).is_none());
+        assert!(tree.leaf_node(ptr(0x1050)).is_none());
+    }
+
+    #[test]
+    fn leaf_node_rejects_addresses_outside_the_region() {
+        let mut tree = MerkleTree::<NullAllocator>::empty(ptr(0x1000), 0x100);
+
+        assert!(tree.leaf_node(ptr(0x0fff)).is_none());
+        assert!(tree.leaf_node(ptr(0x1100)).is_none());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn node_allocator_round_trips_a_single_node() {
+        let node = NodeAllocator::allocate().unwrap();
+        unsafe {
+            assert!(node.as_ref().left.is_none());
+            assert!(node.as_ref().right.is_none());
+            NodeAllocator::deallocate(node);
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn constructed_maps_every_leaf_to_a_distinct_node() {
+        const START: usize = 0x1000;
+        const SIZE: usize = 0x100;
+        const LEAVES: usize = 1 << (HEIGHT - 1);
+        const LEAF_SIZE: usize = SIZE / LEAVES;
+
+        let mut tree = MerkleTree::<NodeAllocator>::constructed(ptr(START), SIZE);
+
+        let mut leaves = [None; LEAVES];
+        for (i, leaf) in leaves.iter_mut().enumerate() {
+            *leaf = tree.leaf_node(ptr(START + i * LEAF_SIZE));
+        }
+
+        for i in 0..LEAVES {
+            assert!(leaves[i].is_some(), "every in-range address must map to a leaf");
+            for j in (i + 1)..LEAVES {
+                assert_ne!(leaves[i], leaves[j], "leaves {i} and {j} must be distinct nodes");
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn constructed_maps_addresses_within_a_leaf_to_the_same_node() {
+        const START: usize = 0x1000;
+        const SIZE: usize = 0x100;
+        const LEAF_SIZE: usize = SIZE / (1 << (HEIGHT - 1));
+
+        let mut tree = MerkleTree::<NodeAllocator>::constructed(ptr(START), SIZE);
+
+        let start_leaf = tree.leaf_node(ptr(START));
+        let mid_leaf = tree.leaf_node(ptr(START + LEAF_SIZE / 2));
+        let end_leaf = tree.leaf_node(ptr(START + LEAF_SIZE - 1));
+
+        assert!(start_leaf.is_some());
+        assert_eq!(start_leaf, mid_leaf);
+        assert_eq!(start_leaf, end_leaf);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn constructed_tree_leaf_node_rejects_out_of_range_addresses() {
+        const START: usize = 0x1000;
+        const SIZE: usize = 0x100;
+
+        let mut tree = MerkleTree::<NodeAllocator>::constructed(ptr(START), SIZE);
+
+        assert!(tree.leaf_node(ptr(START - 1)).is_none());
+        assert!(tree.leaf_node(ptr(START + SIZE)).is_none());
+    }
+}
