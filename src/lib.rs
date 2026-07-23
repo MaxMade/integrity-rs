@@ -4,3 +4,4 @@
 
 pub mod buddy_allocator;
 pub mod merkle_tree;
+pub mod memory;
