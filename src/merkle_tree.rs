@@ -34,10 +34,12 @@ const NUM_NODES: usize = (1 << HEIGHT) - 1;
 /// A single node of a [`MerkleTree`].
 ///
 /// `left` and `right` are `None` for leaves and for nodes that have not yet
-/// been linked into a tree (e.g. immediately after allocation).
+/// been linked into a tree (e.g. immediately after allocation). `parent` is
+/// `None` for the root and, likewise, for nodes not yet linked into a tree.
 pub struct MerkleTreeNode {
     left: Option<MerkleTreeNodePtr>,
     right: Option<MerkleTreeNodePtr>,
+    parent: Option<MerkleTreeNodePtr>,
 }
 
 type MerkleTreeNodePtr = NonNull<MerkleTreeNode>;
@@ -47,8 +49,8 @@ type MerkleTreeNodePtr = NonNull<MerkleTreeNode>;
 /// Implementations only need to hand out and reclaim individual nodes;
 /// [`MerkleTree`] is responsible for all tree structure and traversal.
 pub trait MerkleTreeNodeAllocator {
-    /// Allocate a single node. Its `left`/`right` fields may hold arbitrary
-    /// values; the caller is responsible for initializing them.
+    /// Allocate a single node. Its `left`/`right`/`parent` fields may hold
+    /// arbitrary values; the caller is responsible for initializing them.
     fn allocate() -> Result<NonNull<MerkleTreeNode>, AllocError>;
 
     /// Return a node previously handed out by [`allocate`](Self::allocate)
@@ -124,18 +126,23 @@ impl<A: MerkleTreeNodeAllocator> MerkleTree<A> {
                 let node = node.as_mut();
                 node.left = None;
                 node.right = None;
+                node.parent = None;
             }
 
             nodes[i] = Some(node);
         }
 
         // Construct tree: link every internal node (indices before the
-        // first leaf) to its children at 2i + 1 and 2i + 2.
+        // first leaf) to its children at 2i + 1 and 2i + 2, and each of
+        // those children back to their parent.
         for i in 0..(1 << (HEIGHT - 1)) - 1 {
             unsafe {
-                let node = nodes[i].unwrap().as_mut();
-                node.left = nodes[2 * i + 1];
-                node.right = nodes[2 * i + 2];
+                let mut node = nodes[i].unwrap();
+                node.as_mut().left = nodes[2 * i + 1];
+                node.as_mut().right = nodes[2 * i + 2];
+
+                nodes[2 * i + 1].unwrap().as_mut().parent = Some(node);
+                nodes[2 * i + 2].unwrap().as_mut().parent = Some(node);
             }
         }
 
@@ -205,9 +212,13 @@ mod imp {
     pub struct NodeAllocator;
 
     impl MerkleTreeNodeAllocator for NodeAllocator {
-        /// Box a fresh node with `left`/`right` both `None`.
+        /// Box a fresh node with `left`/`right`/`parent` all `None`.
         fn allocate() -> Result<NonNull<MerkleTreeNode>, AllocError> {
-            let node = Box::new(MerkleTreeNode { left: None, right: None });
+            let node = Box::new(MerkleTreeNode {
+                left: None,
+                right: None,
+                parent: None,
+            });
             Ok(NonNull::from(Box::leak(node)))
         }
 
@@ -284,6 +295,7 @@ mod tests {
         unsafe {
             assert!(node.as_ref().left.is_none());
             assert!(node.as_ref().right.is_none());
+            assert!(node.as_ref().parent.is_none());
             NodeAllocator::deallocate(node);
         }
     }
@@ -304,9 +316,15 @@ mod tests {
         }
 
         for i in 0..LEAVES {
-            assert!(leaves[i].is_some(), "every in-range address must map to a leaf");
+            assert!(
+                leaves[i].is_some(),
+                "every in-range address must map to a leaf"
+            );
             for j in (i + 1)..LEAVES {
-                assert_ne!(leaves[i], leaves[j], "leaves {i} and {j} must be distinct nodes");
+                assert_ne!(
+                    leaves[i], leaves[j],
+                    "leaves {i} and {j} must be distinct nodes"
+                );
             }
         }
     }
@@ -327,6 +345,42 @@ mod tests {
         assert!(start_leaf.is_some());
         assert_eq!(start_leaf, mid_leaf);
         assert_eq!(start_leaf, end_leaf);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn constructed_links_every_node_back_to_its_parent() {
+        const START: usize = 0x1000;
+        const SIZE: usize = 0x100;
+
+        let tree = MerkleTree::<NodeAllocator>::constructed(ptr(START), SIZE);
+
+        let root = tree.root.unwrap();
+        assert!(unsafe { root.as_ref().parent.is_none() });
+
+        // Walk every internal node and check that both of its children
+        // point back to it.
+        let mut queue = [None; NUM_NODES];
+        queue[0] = Some(root);
+        let mut len = 1;
+        let mut idx = 0;
+        while idx < len {
+            let node = queue[idx].unwrap();
+            idx += 1;
+
+            unsafe {
+                for child in [node.as_ref().left, node.as_ref().right] {
+                    if let Some(child) = child {
+                        assert_eq!(child.as_ref().parent, Some(node));
+                        queue[len] = Some(child);
+                        len += 1;
+                    }
+                }
+            }
+        }
+
+        // Every non-root node must have been reached.
+        assert_eq!(len, NUM_NODES);
     }
 
     #[cfg(feature = "std")]
