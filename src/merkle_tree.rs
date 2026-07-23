@@ -14,6 +14,8 @@
 //! Node storage is decoupled from the tree logic via the
 //! [`MerkleTreeNodeAllocator`] trait, so callers can back the tree with
 //! whatever allocation strategy fits (e.g. a [`BuddyAllocator`](crate::buddy_allocator::BuddyAllocator)).
+//! A `Box`-backed implementation, [`NodeAllocator`], is available with
+//! the `std` feature enabled.
 
 extern crate alloc;
 
@@ -181,3 +183,43 @@ impl<A: MerkleTreeNodeAllocator> MerkleTree<A> {
         drag
     }
 }
+
+/// A [`MerkleTreeNodeAllocator`] that allocates each node individually via
+/// `std::boxed::Box`.
+///
+/// Requires the `std` feature: it is only meant as a convenient allocator
+/// for hosted use (e.g. tests), not for the `no_std` targets this crate is
+/// otherwise built for.
+#[cfg(feature = "std")]
+mod imp {
+    extern crate std;
+
+    use std::alloc::AllocError;
+    use std::boxed::Box;
+
+    use core::ptr::NonNull;
+
+    use crate::merkle_tree::{MerkleTreeNode, MerkleTreeNodeAllocator};
+
+    /// Allocates and frees [`MerkleTreeNode`]s one at a time via `Box`.
+    pub struct NodeAllocator;
+
+    impl MerkleTreeNodeAllocator for NodeAllocator {
+        /// Box a fresh node with `left`/`right` both `None`.
+        fn allocate() -> Result<NonNull<MerkleTreeNode>, AllocError> {
+            let node = Box::new(MerkleTreeNode { left: None, right: None });
+            Ok(NonNull::from(Box::leak(node)))
+        }
+
+        /// Reclaim `node` by reconstructing and dropping the `Box` that
+        /// [`allocate`](Self::allocate) leaked it from.
+        unsafe fn deallocate(node: NonNull<MerkleTreeNode>) {
+            unsafe {
+                drop(Box::from_raw(node.as_ptr()));
+            }
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+pub use imp::*;
