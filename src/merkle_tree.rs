@@ -94,8 +94,8 @@ impl<A: MerkleTreeNodeAllocator> MerkleTree<A> {
     /// so that [`leaf_node`](Self::leaf_node) can subdivide the region
     /// evenly at every level.
     fn validate_ptr_size(ptr: NonNull<c_void>, size: usize) {
-        if !ptr.addr().is_power_of_two() {
-            panic!("Start address ({:p}) must be power of two!", ptr);
+        if ptr.addr().get() % 2 != 0 {
+            panic!("Start address ({:p}) must be multiple of two!", ptr);
         }
 
         if !size.is_power_of_two() {
@@ -142,6 +142,7 @@ impl<A: MerkleTreeNodeAllocator> MerkleTree<A> {
                 node.left = None;
                 node.right = None;
                 node.parent = None;
+                node.hash = [0; 32];
             }
 
             nodes[i] = Some(node);
@@ -356,6 +357,34 @@ impl<A: MerkleTreeNodeAllocator> MerkleTree<A> {
     }
 }
 
+impl<A: MerkleTreeNodeAllocator> Drop for MerkleTree<A> {
+    /// Deallocate every node linked into this tree (a no-op for an
+    /// [`empty`](Self::empty) tree, which has none).
+    fn drop(&mut self) {
+        let Some(root) = self.root else { return };
+
+        // BFS over the fixed, complete tree, freeing every node.
+        let mut queue = [None; NUM_NODES];
+        queue[0] = Some(root);
+        let mut len = 1;
+        let mut idx = 0;
+        while idx < len {
+            let node = queue[idx].unwrap();
+            idx += 1;
+
+            let (left, right) = unsafe { (node.as_ref().left, node.as_ref().right) };
+            for child in [left, right] {
+                if let Some(child) = child {
+                    queue[len] = Some(child);
+                    len += 1;
+                }
+            }
+
+            unsafe { A::deallocate(node) };
+        }
+    }
+}
+
 /// A [`MerkleTreeNodeAllocator`] that allocates each node individually via
 /// `std::boxed::Box`.
 ///
@@ -441,7 +470,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "power of two")]
+    #[should_panic(expected = "multiple of two")]
     fn empty_panics_on_non_power_of_two_ptr() {
         MerkleTree::<NullAllocator>::empty(ptr(0x1001), 0x100);
     }
@@ -473,6 +502,32 @@ mod tests {
             assert!(node.as_ref().parent.is_none());
             NodeAllocator::deallocate(node);
         }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn dropping_a_constructed_tree_deallocates_every_node() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static DEALLOCATED: AtomicUsize = AtomicUsize::new(0);
+
+        struct CountingAllocator;
+
+        impl MerkleTreeNodeAllocator for CountingAllocator {
+            fn allocate() -> Result<NonNull<MerkleTreeNode>, AllocError> {
+                NodeAllocator::allocate()
+            }
+
+            unsafe fn deallocate(node: NonNull<MerkleTreeNode>) {
+                DEALLOCATED.fetch_add(1, Ordering::Relaxed);
+                unsafe { NodeAllocator::deallocate(node) };
+            }
+        }
+
+        let tree = MerkleTree::<CountingAllocator>::constructed(ptr(0x1000), 0x100);
+        drop(tree);
+
+        assert_eq!(DEALLOCATED.load(Ordering::Relaxed), NUM_NODES);
     }
 
     #[cfg(feature = "std")]

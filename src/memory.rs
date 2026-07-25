@@ -27,6 +27,8 @@ pub trait MemoryManagement<const ALLOC_SIZE: usize> {
     /// Reserve a backing region large enough for `total_size` bytes.
     fn new(total_size: usize) -> Self;
 
+    fn start(&self) -> NonNull<c_void>;
+
     /// Hand out one more `ALLOC_SIZE`-byte chunk from the region, or
     /// `Err(AllocError)` once the region has no room left for another one.
     fn allocate(&self) -> Result<NonNull<c_void>, AllocError>;
@@ -86,7 +88,7 @@ mod imp {
                     ptr::null_mut(),
                     total_size,
                     ProtFlags::READ | ProtFlags::WRITE,
-                    MapFlags::PRIVATE | MapFlags::HUGETLB | MapFlags::HUGE_2MB | MapFlags::HUGE_1GB,
+                    MapFlags::PRIVATE,
                 )
             } {
                 Ok(start) => NonNull::new(start).unwrap(),
@@ -131,6 +133,10 @@ mod imp {
             };
 
             unsafe { Ok(self.start.add(offset)) }
+        }
+
+        fn start(&self) -> NonNull<c_void> {
+            self.start
         }
     }
 
