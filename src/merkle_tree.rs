@@ -158,7 +158,7 @@ impl<A: MerkleTreeNodeAllocator> MerkleTree<A> {
     /// Find the leaf node covering `ptr`, or `None` if `ptr` falls outside
     /// this tree's region or the path to its leaf is not fully linked
     /// (e.g. an [`empty`](Self::empty) tree).
-    pub fn leaf_node(&mut self, ptr: NonNull<c_void>) -> Option<MerkleTreeNodePtr> {
+    pub fn leaf_node(&self, ptr: NonNull<c_void>) -> Option<MerkleTreeNodePtr> {
         let ptr = usize::from(ptr.addr());
         let mut start = usize::from(self.ptr.addr());
         let mut size = self.size;
@@ -243,6 +243,70 @@ impl<A: MerkleTreeNodeAllocator> MerkleTree<A> {
                 drag = node.parent;
             }
         }
+    }
+
+    /// Check that `hash` matches the cached hash of the leaf covering `ptr`,
+    /// and that every ancestor's cached hash up to the root is consistent
+    /// with its children (i.e. still equals `blake3(left.hash ||
+    /// right.hash)`).
+    ///
+    /// This does not recompute anything: it only verifies that the tree's
+    /// cached hashes agree with each other and with `hash`, so it catches
+    /// both a stale/wrong leaf hash and any node's cached hash having been
+    /// corrupted independently of [`rehash`](Self::rehash).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `ptr` falls outside this tree's region, or its leaf is not
+    /// yet linked (see [`leaf_node`](Self::leaf_node)).
+    pub fn validate(&self, ptr: NonNull<c_void>, hash: &[u8; 32]) -> bool {
+        // Find associated leaf node
+        let node = match self.leaf_node(ptr) {
+            Some(node) => node,
+            None => panic!("Unable to find leaf node for address ({:p})", ptr),
+        };
+
+        // Check leaf node
+        let mut drag = unsafe {
+            let node = node.as_ref();
+
+            // Error: hashes didn't match...
+            if node.hash != *hash {
+                return false;
+            }
+
+            node.parent
+        };
+
+        // Continue with parents
+        while let Some(node) = drag {
+            unsafe {
+                let node = node.as_ref();
+                let mut hasher = blake3::Hasher::new();
+
+                // Process left child
+                if let Some(child) = node.left {
+                    hasher.update(child.as_ref().hash.as_slice());
+                }
+
+                // Process right child
+                if let Some(child) = node.right {
+                    hasher.update(child.as_ref().hash.as_slice());
+                }
+
+                let hash = hasher.finalize();
+
+                // Error: hashes didn't match...
+                if node.hash != *hash.as_bytes() {
+                    return false;
+                }
+
+                // Continue with parent
+                drag = node.parent;
+            }
+        }
+
+        true
     }
 }
 
@@ -329,7 +393,7 @@ mod tests {
 
     #[test]
     fn leaf_node_on_empty_tree_is_always_none() {
-        let mut tree = MerkleTree::<NullAllocator>::empty(ptr(0x1000), 0x100);
+        let tree = MerkleTree::<NullAllocator>::empty(ptr(0x1000), 0x100);
 
         // In range, but no nodes have been linked yet.
         assert!(tree.leaf_node(ptr(0x1000)).is_none());
@@ -338,7 +402,7 @@ mod tests {
 
     #[test]
     fn leaf_node_rejects_addresses_outside_the_region() {
-        let mut tree = MerkleTree::<NullAllocator>::empty(ptr(0x1000), 0x100);
+        let tree = MerkleTree::<NullAllocator>::empty(ptr(0x1000), 0x100);
 
         assert!(tree.leaf_node(ptr(0x0fff)).is_none());
         assert!(tree.leaf_node(ptr(0x1100)).is_none());
@@ -364,7 +428,7 @@ mod tests {
         const LEAVES: usize = 1 << (HEIGHT - 1);
         const LEAF_SIZE: usize = SIZE / LEAVES;
 
-        let mut tree = MerkleTree::<NodeAllocator>::constructed(ptr(START), SIZE);
+        let tree = MerkleTree::<NodeAllocator>::constructed(ptr(START), SIZE);
 
         let mut leaves = [None; LEAVES];
         for (i, leaf) in leaves.iter_mut().enumerate() {
@@ -392,7 +456,7 @@ mod tests {
         const SIZE: usize = 0x100;
         const LEAF_SIZE: usize = SIZE / (1 << (HEIGHT - 1));
 
-        let mut tree = MerkleTree::<NodeAllocator>::constructed(ptr(START), SIZE);
+        let tree = MerkleTree::<NodeAllocator>::constructed(ptr(START), SIZE);
 
         let start_leaf = tree.leaf_node(ptr(START));
         let mid_leaf = tree.leaf_node(ptr(START + LEAF_SIZE / 2));
@@ -445,9 +509,153 @@ mod tests {
         const START: usize = 0x1000;
         const SIZE: usize = 0x100;
 
-        let mut tree = MerkleTree::<NodeAllocator>::constructed(ptr(START), SIZE);
+        let tree = MerkleTree::<NodeAllocator>::constructed(ptr(START), SIZE);
 
         assert!(tree.leaf_node(ptr(START - 1)).is_none());
         assert!(tree.leaf_node(ptr(START + SIZE)).is_none());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn rehash_sets_the_leaf_hash() {
+        const START: usize = 0x1000;
+        const SIZE: usize = 0x100;
+
+        let mut tree = MerkleTree::<NodeAllocator>::constructed(ptr(START), SIZE);
+        let hash = [7u8; 32];
+
+        tree.rehash(ptr(START), &hash);
+
+        let leaf = tree.leaf_node(ptr(START)).unwrap();
+        assert_eq!(unsafe { leaf.as_ref().hash }, hash);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn rehash_computes_ancestor_hashes_as_blake3_of_children() {
+        const START: usize = 0x1000;
+        const SIZE: usize = 0x100;
+        const LEAF_SIZE: usize = SIZE / (1 << (HEIGHT - 1));
+
+        let mut tree = MerkleTree::<NodeAllocator>::constructed(ptr(START), SIZE);
+        let left_hash = [1u8; 32];
+        let right_hash = [2u8; 32];
+
+        // Rehash the two leaves sharing the lowest-level parent.
+        tree.rehash(ptr(START), &left_hash);
+        tree.rehash(ptr(START + LEAF_SIZE), &right_hash);
+
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&left_hash);
+        hasher.update(&right_hash);
+        let expected = *hasher.finalize().as_bytes();
+
+        let parent = unsafe { tree.leaf_node(ptr(START)).unwrap().as_ref().parent }.unwrap();
+        assert_eq!(unsafe { parent.as_ref().hash }, expected);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn rehash_leaves_unrelated_subtree_untouched() {
+        const START: usize = 0x1000;
+        const SIZE: usize = 0x100;
+        const LEAF_SIZE: usize = SIZE / (1 << (HEIGHT - 1));
+
+        let mut tree = MerkleTree::<NodeAllocator>::constructed(ptr(START), SIZE);
+
+        tree.rehash(ptr(START), &[7u8; 32]);
+
+        // A leaf outside the rehashed leaf's path must still hold its
+        // initial, all-zero hash.
+        let untouched = tree.leaf_node(ptr(START + SIZE - LEAF_SIZE)).unwrap();
+        assert_eq!(unsafe { untouched.as_ref().hash }, [0u8; 32]);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    #[should_panic(expected = "Unable to find leaf node")]
+    fn rehash_panics_for_out_of_range_address() {
+        const START: usize = 0x1000;
+        const SIZE: usize = 0x100;
+
+        let mut tree = MerkleTree::<NodeAllocator>::constructed(ptr(START), SIZE);
+
+        tree.rehash(ptr(START + SIZE), &[0u8; 32]);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn validate_is_false_on_a_freshly_constructed_tree() {
+        const START: usize = 0x1000;
+        const SIZE: usize = 0x100;
+
+        let tree = MerkleTree::<NodeAllocator>::constructed(ptr(START), SIZE);
+
+        // Every node starts out with an all-zero hash, which is not the
+        // blake3 hash of two all-zero children, so validation must fail
+        // until something has actually been rehashed.
+        assert!(!tree.validate(ptr(START), &[0u8; 32]));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn validate_is_true_after_a_matching_rehash() {
+        const START: usize = 0x1000;
+        const SIZE: usize = 0x100;
+
+        let mut tree = MerkleTree::<NodeAllocator>::constructed(ptr(START), SIZE);
+        let hash = [7u8; 32];
+
+        tree.rehash(ptr(START), &hash);
+
+        assert!(tree.validate(ptr(START), &hash));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn validate_is_false_for_a_mismatched_hash() {
+        const START: usize = 0x1000;
+        const SIZE: usize = 0x100;
+
+        let mut tree = MerkleTree::<NodeAllocator>::constructed(ptr(START), SIZE);
+
+        tree.rehash(ptr(START), &[7u8; 32]);
+
+        assert!(!tree.validate(ptr(START), &[9u8; 32]));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn validate_is_false_when_an_ancestor_hash_was_tampered_with() {
+        const START: usize = 0x1000;
+        const SIZE: usize = 0x100;
+
+        let mut tree = MerkleTree::<NodeAllocator>::constructed(ptr(START), SIZE);
+        let hash = [7u8; 32];
+
+        tree.rehash(ptr(START), &hash);
+        assert!(tree.validate(ptr(START), &hash));
+
+        // Corrupt the parent's cached hash directly, bypassing rehash.
+        let mut parent = unsafe { tree.leaf_node(ptr(START)).unwrap().as_ref().parent }.unwrap();
+        unsafe {
+            parent.as_mut().hash = [0xffu8; 32];
+        }
+
+        // The leaf hash still matches, but the tampered ancestor no longer
+        // agrees with its children.
+        assert!(!tree.validate(ptr(START), &hash));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    #[should_panic(expected = "Unable to find leaf node")]
+    fn validate_panics_for_out_of_range_address() {
+        const START: usize = 0x1000;
+        const SIZE: usize = 0x100;
+
+        let tree = MerkleTree::<NodeAllocator>::constructed(ptr(START), SIZE);
+
+        tree.validate(ptr(START + SIZE), &[0u8; 32]);
     }
 }
