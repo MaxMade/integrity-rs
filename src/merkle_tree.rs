@@ -11,7 +11,11 @@
 //! back to the single leaf that fully contains it by binary-searching the
 //! address one level at a time: at each level the current window is halved,
 //! and the address falls in either the lower half (left child, same start)
-//! or the upper half (right child, start moved up by the halved size).
+//! or the upper half (right child, start moved up by the halved size). Any
+//! node missing along that path — including the root, for e.g. an
+//! [`empty`](MerkleTree::empty) tree — is allocated and linked in on the
+//! spot, so a tree only ever pays for the nodes some address has actually
+//! been looked up (and therefore `rehash`ed/`validate`d) through.
 //!
 //! [`rehash`](MerkleTree::rehash) and [`validate`](MerkleTree::validate) both
 //! read the actual bytes at `[ptr, ptr + size)` (via `unsafe` raw-pointer
@@ -119,6 +123,29 @@ impl<A: MerkleTreeNodeAllocator> MerkleTree<A> {
         }
     }
 
+    /// Allocate a single node via `A`, initialized as a fresh, unlinked leaf
+    /// (`left`/`right`/`parent` all `None`, `hash` all zero).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `A::allocate` fails.
+    fn allocate_node() -> MerkleTreeNodePtr {
+        let mut node = match A::allocate() {
+            Ok(node) => node,
+            Err(error) => panic!("Unable to allocate MerkleTreeNode: {}", error),
+        };
+
+        unsafe {
+            let node = node.as_mut();
+            node.left = None;
+            node.right = None;
+            node.parent = None;
+            node.hash = [0; 32];
+        }
+
+        node
+    }
+
     /// Create a tree over `[ptr, ptr + size)`, allocating and linking all
     /// `NUM_NODES` nodes up front.
     ///
@@ -132,20 +159,7 @@ impl<A: MerkleTreeNodeAllocator> MerkleTree<A> {
         // Allocate nodes
         let mut nodes = [None; NUM_NODES];
         for i in 0..NUM_NODES {
-            let mut node = match A::allocate() {
-                Ok(node) => node,
-                Err(error) => panic!("Unable to allocate MerkleTreeNode: {}", error),
-            };
-
-            unsafe {
-                let node = node.as_mut();
-                node.left = None;
-                node.right = None;
-                node.parent = None;
-                node.hash = [0; 32];
-            }
-
-            nodes[i] = Some(node);
+            nodes[i] = Some(Self::allocate_node());
         }
 
         // Construct tree: link every internal node (indices before the
@@ -170,12 +184,20 @@ impl<A: MerkleTreeNodeAllocator> MerkleTree<A> {
         }
     }
 
-    /// Find the single leaf node that fully contains `[ptr, ptr + size)`, or
-    /// `None` if that range is not entirely covered by one leaf (it falls
-    /// outside this tree's region, straddles two leaves, or overflows), or
-    /// the path to its leaf is not fully linked (e.g. an
-    /// [`empty`](Self::empty) tree).
-    pub fn leaf_node(&self, ptr: NonNull<u8>, size: usize) -> Option<MerkleTreeNodePtr> {
+    /// Find the single leaf node that fully contains `[ptr, ptr + size)`,
+    /// allocating and linking in any node missing along the way (including
+    /// the root, for e.g. an [`empty`](Self::empty) tree) — so this always
+    /// succeeds for any range this tree covers, regardless of how much of
+    /// it was already linked.
+    ///
+    /// Returns `None` only if that range is not entirely covered by one
+    /// leaf: it falls outside this tree's region, straddles two leaves, or
+    /// overflows. No allocation happens in that case.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `A::allocate` fails to provide a node needed along the way.
+    pub fn leaf_node(&mut self, ptr: NonNull<u8>, size: usize) -> Option<MerkleTreeNodePtr> {
         let ptr = usize::from(ptr.addr());
         let mut mem_start = usize::from(self.ptr.addr());
         let mut mem_size = self.size;
@@ -188,20 +210,39 @@ impl<A: MerkleTreeNodeAllocator> MerkleTree<A> {
             return None;
         }
 
-        let mut drag = self.root;
+        if self.root.is_none() {
+            self.root = Some(Self::allocate_node());
+        }
+
+        let mut node = self.root.unwrap();
         for _ in 0..HEIGHT - 1 {
-            match drag {
-                Some(node) => {
-                    mem_size /= 2;
-                    drag = match ptr >= mem_start + mem_size {
-                        true => {
-                            mem_start += mem_size;
-                            unsafe { node.as_ref().right }
-                        }
-                        false => unsafe { node.as_ref().left },
-                    };
+            mem_size /= 2;
+
+            let go_right = ptr >= mem_start + mem_size;
+            if go_right {
+                mem_start += mem_size;
+            }
+
+            let child = unsafe {
+                match go_right {
+                    true => node.as_ref().right,
+                    false => node.as_ref().left,
                 }
-                None => return None,
+            };
+
+            node = match child {
+                Some(child) => child,
+                None => {
+                    let mut child = Self::allocate_node();
+                    unsafe {
+                        child.as_mut().parent = Some(node);
+                        match go_right {
+                            true => node.as_mut().right = Some(child),
+                            false => node.as_mut().left = Some(child),
+                        }
+                    }
+                    child
+                }
             };
         }
 
@@ -213,18 +254,19 @@ impl<A: MerkleTreeNodeAllocator> MerkleTree<A> {
             return None;
         }
 
-        drag
+        Some(node)
     }
 
     /// Hash the `size` bytes at `ptr` with BLAKE3 and record the result as
     /// the hash of the leaf covering that range, then recompute the hash of
-    /// every ancestor up to the root.
+    /// every ancestor up to the root — allocating any node along that path
+    /// that isn't linked yet (see [`leaf_node`](Self::leaf_node)).
     ///
     /// Each internal node's hash is `blake3(left.hash || right.hash)` (a
-    /// child contributes nothing if it is absent, which only happens for a
-    /// not-yet-linked tree). This makes every node's hash a pure function of
-    /// the memory contents in its subtree at the time of the last `rehash`
-    /// call covering each leaf.
+    /// child contributes nothing if that side of the tree hasn't been
+    /// touched yet). This makes every node's hash a pure function of the
+    /// memory contents in its subtree at the time of the last `rehash` call
+    /// covering each leaf.
     ///
     /// # Safety
     ///
@@ -234,8 +276,8 @@ impl<A: MerkleTreeNodeAllocator> MerkleTree<A> {
     /// # Panics
     ///
     /// Panics if `[ptr, ptr + size)` is not fully contained in a single leaf
-    /// of this tree, or that leaf is not yet linked (see
-    /// [`leaf_node`](Self::leaf_node)).
+    /// of this tree, or `A::allocate` fails to provide a node needed along
+    /// the way (see [`leaf_node`](Self::leaf_node)).
     pub unsafe fn rehash(&mut self, ptr: NonNull<u8>, size: usize) {
         // Find associated leaf node
         let mut node = match self.leaf_node(ptr, size) {
@@ -289,7 +331,12 @@ impl<A: MerkleTreeNodeAllocator> MerkleTree<A> {
     /// This recomputes the leaf hash from the current memory contents but
     /// does not update anything: it catches both memory that has changed
     /// since the last [`rehash`](Self::rehash) of this leaf, and any node's
-    /// cached hash having been corrupted directly.
+    /// cached hash having been corrupted directly. Note that it still takes
+    /// `&mut self`: like `rehash`, it allocates any node along the way that
+    /// isn't linked yet (see [`leaf_node`](Self::leaf_node)) — which, for a
+    /// range that was never `rehash`ed, just means it reliably returns
+    /// `false` (comparing against a fresh, all-zero hash) rather than
+    /// panicking.
     ///
     /// # Safety
     ///
@@ -299,9 +346,9 @@ impl<A: MerkleTreeNodeAllocator> MerkleTree<A> {
     /// # Panics
     ///
     /// Panics if `[ptr, ptr + size)` is not fully contained in a single leaf
-    /// of this tree, or that leaf is not yet linked (see
-    /// [`leaf_node`](Self::leaf_node)).
-    pub unsafe fn validate(&self, ptr: NonNull<u8>, size: usize) -> bool {
+    /// of this tree, or `A::allocate` fails to provide a node needed along
+    /// the way (see [`leaf_node`](Self::leaf_node)).
+    pub unsafe fn validate(&mut self, ptr: NonNull<u8>, size: usize) -> bool {
         // Find associated leaf node
         let node = match self.leaf_node(ptr, size) {
             Some(node) => node,
@@ -475,18 +522,26 @@ mod tests {
         MerkleTree::<NullAllocator>::empty(ptr(0x1001), 0x100);
     }
 
+    #[cfg(feature = "std")]
     #[test]
-    fn leaf_node_on_empty_tree_is_always_none() {
-        let tree = MerkleTree::<NullAllocator>::empty(ptr(0x1000), 0x100);
+    fn leaf_node_on_empty_tree_allocates_and_links_missing_nodes() {
+        let mut tree = MerkleTree::<NodeAllocator>::empty(ptr(0x1000), 0x100);
 
-        // In range, but no nodes have been linked yet.
-        assert!(tree.leaf_node(byte_ptr(0x1000), 1).is_none());
-        assert!(tree.leaf_node(byte_ptr(0x1050), 1).is_none());
+        // In range, but nothing has been linked yet: this must succeed by
+        // allocating and linking every node along the way, not fail.
+        let leaf = tree.leaf_node(byte_ptr(0x1000), 1).unwrap();
+        assert_eq!(unsafe { leaf.as_ref().hash }, [0u8; 32]);
+
+        // A second lookup on the same address reuses the same node instead
+        // of allocating a new one.
+        assert_eq!(tree.leaf_node(byte_ptr(0x1000), 1), Some(leaf));
     }
 
     #[test]
     fn leaf_node_rejects_addresses_outside_the_region() {
-        let tree = MerkleTree::<NullAllocator>::empty(ptr(0x1000), 0x100);
+        // Out of range, so this must never allocate anything -
+        // `NullAllocator` would panic if it did.
+        let mut tree = MerkleTree::<NullAllocator>::empty(ptr(0x1000), 0x100);
 
         assert!(tree.leaf_node(byte_ptr(0x0fff), 1).is_none());
         assert!(tree.leaf_node(byte_ptr(0x1100), 1).is_none());
@@ -538,7 +593,7 @@ mod tests {
         const LEAVES: usize = 1 << (HEIGHT - 1);
         const LEAF_SIZE: usize = SIZE / LEAVES;
 
-        let tree = MerkleTree::<NodeAllocator>::constructed(ptr(START), SIZE);
+        let mut tree = MerkleTree::<NodeAllocator>::constructed(ptr(START), SIZE);
 
         let mut leaves = [None; LEAVES];
         for (i, leaf) in leaves.iter_mut().enumerate() {
@@ -566,7 +621,7 @@ mod tests {
         const SIZE: usize = 0x100;
         const LEAF_SIZE: usize = SIZE / (1 << (HEIGHT - 1));
 
-        let tree = MerkleTree::<NodeAllocator>::constructed(ptr(START), SIZE);
+        let mut tree = MerkleTree::<NodeAllocator>::constructed(ptr(START), SIZE);
 
         let start_leaf = tree.leaf_node(byte_ptr(START), 1);
         let mid_leaf = tree.leaf_node(byte_ptr(START + LEAF_SIZE / 2), 1);
@@ -584,7 +639,7 @@ mod tests {
         const SIZE: usize = 0x100;
         const LEAF_SIZE: usize = SIZE / (1 << (HEIGHT - 1));
 
-        let tree = MerkleTree::<NodeAllocator>::constructed(ptr(START), SIZE);
+        let mut tree = MerkleTree::<NodeAllocator>::constructed(ptr(START), SIZE);
 
         // The range fits if it stays within one leaf...
         assert!(tree.leaf_node(byte_ptr(START), LEAF_SIZE).is_some());
@@ -634,7 +689,7 @@ mod tests {
         const START: usize = 0x1000;
         const SIZE: usize = 0x100;
 
-        let tree = MerkleTree::<NodeAllocator>::constructed(ptr(START), SIZE);
+        let mut tree = MerkleTree::<NodeAllocator>::constructed(ptr(START), SIZE);
 
         assert!(tree.leaf_node(byte_ptr(START - 1), 1).is_none());
         assert!(tree.leaf_node(byte_ptr(START + SIZE), 1).is_none());
@@ -783,6 +838,34 @@ mod tests {
 
     #[cfg(feature = "std")]
     #[test]
+    fn rehash_on_an_empty_tree_lazily_builds_only_the_touched_path() {
+        const START: usize = 1 << 36;
+        const SIZE: usize = 0x1000;
+        const LEAF_SIZE: usize = SIZE / NUM_LEAF_NODES;
+
+        let region = MappedRegion::new(START, SIZE);
+        let mut tree = MerkleTree::<NodeAllocator>::empty(region.base(), SIZE);
+
+        // No prior `constructed()` call: this must allocate and link the
+        // whole root-to-leaf path on its own.
+        unsafe { tree.rehash(region.byte_ptr(0), LEAF_SIZE) };
+
+        let expected = *blake3::hash(unsafe {
+            slice::from_raw_parts(region.byte_ptr(0).as_ptr(), LEAF_SIZE)
+        })
+        .as_bytes();
+
+        let leaf = tree.leaf_node(region.byte_ptr(0), LEAF_SIZE).unwrap();
+        assert_eq!(unsafe { leaf.as_ref().hash }, expected);
+
+        // Only the touched path was allocated: the leaf's sibling subtree
+        // was never looked up, so it must still be unlinked.
+        let sibling = unsafe { leaf.as_ref().parent.unwrap().as_ref().right };
+        assert!(sibling.is_none());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
     #[should_panic(expected = "Unable to find leaf node")]
     fn rehash_panics_for_out_of_range_address() {
         const START: usize = 0x1000;
@@ -803,7 +886,7 @@ mod tests {
         const LEAF_SIZE: usize = SIZE / NUM_LEAF_NODES;
 
         let region = MappedRegion::new(START, SIZE);
-        let tree = MerkleTree::<NodeAllocator>::constructed(region.base(), SIZE);
+        let mut tree = MerkleTree::<NodeAllocator>::constructed(region.base(), SIZE);
 
         // Every node starts out with an all-zero cached hash, which is not
         // the blake3 hash of the (zero-filled) memory it covers, so
@@ -881,7 +964,7 @@ mod tests {
         const START: usize = 0x1000;
         const SIZE: usize = 0x100;
 
-        let tree = MerkleTree::<NodeAllocator>::constructed(ptr(START), SIZE);
+        let mut tree = MerkleTree::<NodeAllocator>::constructed(ptr(START), SIZE);
 
         // Out of range: `leaf_node` returns `None` before this address is
         // ever dereferenced, so no real backing memory is needed.
