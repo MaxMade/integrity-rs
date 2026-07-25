@@ -40,6 +40,7 @@ pub struct MerkleTreeNode {
     left: Option<MerkleTreeNodePtr>,
     right: Option<MerkleTreeNodePtr>,
     parent: Option<MerkleTreeNodePtr>,
+    hash: [u8; 32],
 }
 
 type MerkleTreeNodePtr = NonNull<MerkleTreeNode>;
@@ -189,6 +190,60 @@ impl<A: MerkleTreeNodeAllocator> MerkleTree<A> {
 
         drag
     }
+
+    /// Update the hash of the leaf covering `ptr` to `hash`, then recompute
+    /// the hash of every ancestor up to the root.
+    ///
+    /// Each internal node's hash is `blake3(left.hash || right.hash)`
+    /// (a child contributes nothing if it is absent, which only happens for
+    /// a not-yet-linked tree). This makes every node's hash a pure function
+    /// of the leaf hashes in its subtree, so two trees built over the same
+    /// content always agree at every level, independent of where their
+    /// nodes happen to be allocated.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `ptr` falls outside this tree's region, or its leaf is not
+    /// yet linked (see [`leaf_node`](Self::leaf_node)).
+    pub fn rehash(&mut self, ptr: NonNull<c_void>, hash: &[u8; 32]) {
+        // Find associated leaf node
+        let mut node = match self.leaf_node(ptr) {
+            Some(node) => node,
+            None => panic!("Unable to find leaf node for address ({:p})", ptr),
+        };
+
+        // Update hash of leaf node
+        let mut drag = unsafe {
+            let node = node.as_mut();
+            node.hash.copy_from_slice(hash);
+            node.parent
+        };
+
+        // Continue with parents
+        while let Some(mut node) = drag {
+            unsafe {
+                let node = node.as_mut();
+                let mut hasher = blake3::Hasher::new();
+
+                // Process left child
+                if let Some(child) = node.left {
+                    hasher.update(child.as_ref().hash.as_slice());
+                }
+
+                // Process right child
+                if let Some(child) = node.right {
+                    hasher.update(child.as_ref().hash.as_slice());
+                }
+
+                // Update hash
+                let hash = hasher.finalize();
+                node.hash.copy_from_slice(hash.as_bytes());
+
+                // Continue with parent
+                drag = node.parent;
+            }
+        }
+    }
 }
 
 /// A [`MerkleTreeNodeAllocator`] that allocates each node individually via
@@ -218,6 +273,7 @@ mod imp {
                 left: None,
                 right: None,
                 parent: None,
+                hash: [0; 32],
             });
             Ok(NonNull::from(Box::leak(node)))
         }
