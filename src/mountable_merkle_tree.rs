@@ -380,41 +380,59 @@ pub struct MountableMerkleTreeGuard<
 impl<'a, MTNA: MerkleTreeNodeAllocator, MM: MemoryManagement<MEM_PER_SUBTREE>, L: RawMutex, T>
     MountableMerkleTreeGuard<'a, MTNA, MM, L, T>
 {
-    /// Validate the stored value, then run `cb` against a shared reference
-    /// to it, returning `cb`'s result.
+    /// Validate the stored value, copy it out, and run `cb` against that
+    /// copy — with the lock released for the duration of `cb`.
     ///
-    /// The lock is held for the whole call and the value is borrowed in
-    /// place — never copied out — so this is sound for any `T`, not just
-    /// `Copy` ones. Because the lock is held throughout, `cb` must not
-    /// re-enter this tree (the mutex is not reentrant).
+    /// Restricted to `T: Copy`: the value is duplicated with a bitwise
+    /// `read()`, which is only sound when duplication can't alias and there
+    /// is no destructor to double-run — exactly what `Copy` guarantees
+    /// (`Copy` and `Drop` are mutually exclusive). Because `cb` sees a
+    /// detached copy, it may hold the lock again / re-enter this tree.
     ///
     /// # Panics
     ///
     /// Panics if the value fails its integrity check (see
     /// [`MountableMerkleTree::validate`]).
-    pub fn with<R, CB: FnOnce(&T) -> R>(&self, cb: CB) -> R {
-        let mut mmt = self.mmt.0.lock();
-        mmt.validate(self.ptr.cast());
+    pub fn with<R, CB: FnOnce(&T) -> R>(&self, cb: CB) -> R
+    where
+        T: Copy,
+    {
+        let value = {
+            let mut mmt = self.mmt.0.lock();
+            mmt.validate(self.ptr.cast());
+            unsafe { self.ptr.read() }
+        };
 
-        // Borrow in place: a bitwise `read()` copy would double-own any
-        // resources a non-`Copy` `T` holds.
-        cb(unsafe { self.ptr.as_ref() })
+        cb(&value)
     }
 
-    /// Like [`with`](Self::with) but hands `cb` a mutable reference and
-    /// re-hashes afterwards, so the mutation is recorded and later reads
-    /// validate against the new contents.
+    /// Like [`with`](Self::with) but hands `cb` a mutable reference to the
+    /// copy and, after `cb` returns, writes it back and re-hashes so the
+    /// mutation is recorded.
+    ///
+    /// The lock is released while `cb` runs and re-taken only for the
+    /// write-back, so concurrent `with_mut`s are last-writer-wins; this
+    /// stays memory-safe purely because `T: Copy` (the write-back overwrites
+    /// without dropping, and the copy has no destructor).
     ///
     /// # Panics
     ///
     /// Panics if the value fails its integrity check on entry.
-    pub fn with_mut<R, CB: FnOnce(&mut T) -> R>(&self, cb: CB) -> R {
+    pub fn with_mut<R, CB: FnOnce(&mut T) -> R>(&self, cb: CB) -> R
+    where
+        T: Copy,
+    {
+        let mut value = {
+            let mut mmt = self.mmt.0.lock();
+            mmt.validate(self.ptr.cast());
+            unsafe { self.ptr.read() }
+        };
+
+        // Callback runs without the lock held.
+        let result = cb(&mut value);
+
         let mut mmt = self.mmt.0.lock();
-        mmt.validate(self.ptr.cast());
-
-        let mut ptr = self.ptr;
-        let result = cb(unsafe { ptr.as_mut() });
-
+        unsafe { self.ptr.write(value) };
         mmt.rehash(self.ptr.cast());
         result
     }
