@@ -402,6 +402,21 @@ impl<A: MerkleTreeNodeAllocator> MerkleTree<A> {
 
         true
     }
+
+    /// The root node's hash — the digest committing to every leaf hash in
+    /// this tree — or all-zeros if the tree has no nodes yet (an
+    /// [`empty`](Self::empty) tree, or one nothing has been
+    /// [`rehash`](Self::rehash)ed through).
+    ///
+    /// This is the value a higher-level tree hashes to attest to this one:
+    /// it changes whenever any covered leaf is re-hashed, unlike the bytes
+    /// of the `MerkleTree` struct itself.
+    pub fn root_hash(&self) -> [u8; 32] {
+        match self.root {
+            Some(root) => unsafe { root.as_ref().hash },
+            None => [0; 32],
+        }
+    }
 }
 
 impl<A: MerkleTreeNodeAllocator> Drop for MerkleTree<A> {
@@ -722,7 +737,9 @@ mod tests {
                     MapFlags::PRIVATE | MapFlags::FIXED_NOREPLACE,
                 )
             }
-            .unwrap_or_else(|error| panic!("Unable to map {size:#x} byte(s) at {addr:#x}: {error}"));
+            .unwrap_or_else(|error| {
+                panic!("Unable to map {size:#x} byte(s) at {addr:#x}: {error}")
+            });
 
             Self {
                 start: NonNull::new(start).unwrap(),
@@ -796,10 +813,9 @@ mod tests {
             tree.rehash(region.byte_ptr(LEAF_SIZE), LEAF_SIZE);
         }
 
-        let left_hash = *blake3::hash(unsafe {
-            slice::from_raw_parts(region.byte_ptr(0).as_ptr(), LEAF_SIZE)
-        })
-        .as_bytes();
+        let left_hash =
+            *blake3::hash(unsafe { slice::from_raw_parts(region.byte_ptr(0).as_ptr(), LEAF_SIZE) })
+                .as_bytes();
         let right_hash = *blake3::hash(unsafe {
             slice::from_raw_parts(region.byte_ptr(LEAF_SIZE).as_ptr(), LEAF_SIZE)
         })
@@ -810,9 +826,13 @@ mod tests {
         hasher.update(&right_hash);
         let expected = *hasher.finalize().as_bytes();
 
-        let parent =
-            unsafe { tree.leaf_node(region.byte_ptr(0), LEAF_SIZE).unwrap().as_ref().parent }
-                .unwrap();
+        let parent = unsafe {
+            tree.leaf_node(region.byte_ptr(0), LEAF_SIZE)
+                .unwrap()
+                .as_ref()
+                .parent
+        }
+        .unwrap();
         assert_eq!(unsafe { parent.as_ref().hash }, expected);
     }
 
@@ -850,10 +870,9 @@ mod tests {
         // whole root-to-leaf path on its own.
         unsafe { tree.rehash(region.byte_ptr(0), LEAF_SIZE) };
 
-        let expected = *blake3::hash(unsafe {
-            slice::from_raw_parts(region.byte_ptr(0).as_ptr(), LEAF_SIZE)
-        })
-        .as_bytes();
+        let expected =
+            *blake3::hash(unsafe { slice::from_raw_parts(region.byte_ptr(0).as_ptr(), LEAF_SIZE) })
+                .as_bytes();
 
         let leaf = tree.leaf_node(region.byte_ptr(0), LEAF_SIZE).unwrap();
         assert_eq!(unsafe { leaf.as_ref().hash }, expected);
@@ -945,9 +964,13 @@ mod tests {
         }
 
         // Corrupt the parent's cached hash directly, bypassing rehash.
-        let mut parent =
-            unsafe { tree.leaf_node(region.byte_ptr(0), LEAF_SIZE).unwrap().as_ref().parent }
-                .unwrap();
+        let mut parent = unsafe {
+            tree.leaf_node(region.byte_ptr(0), LEAF_SIZE)
+                .unwrap()
+                .as_ref()
+                .parent
+        }
+        .unwrap();
         unsafe {
             parent.as_mut().hash = [0xffu8; 32];
         }
