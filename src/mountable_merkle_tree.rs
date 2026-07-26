@@ -10,6 +10,7 @@ use crate::{
     merkle_tree::{self, MerkleTree, MerkleTreeNodeAllocator},
 };
 
+use alloc::alloc::AllocError;
 use alloc::alloc::Layout;
 use alloc::boxed::Box;
 
@@ -28,6 +29,8 @@ pub struct MountableMerkleTree<MTNA: MerkleTreeNodeAllocator, MM: MemoryManageme
     sub_trees: Box<[MerkleTree<MTNA>]>,
 
     memory_management: MM,
+
+    memory_allocator_idx: usize,
 
     memory_allocators: Box<[BuddyAllocator<16>]>,
 }
@@ -92,7 +95,9 @@ impl<MTNA: MerkleTreeNodeAllocator, MM: MemoryManagement<MEM_PER_SUBTREE>>
                 memory_allocators[i].write(memory_allocator);
             }
 
-            Box::from_raw(Box::into_raw(memory_allocators) as *mut [BuddyAllocator<16>; NUM_SUBTREES])
+            Box::from_raw(
+                Box::into_raw(memory_allocators) as *mut [BuddyAllocator<16>; NUM_SUBTREES]
+            )
         };
 
         Self {
@@ -100,7 +105,37 @@ impl<MTNA: MerkleTreeNodeAllocator, MM: MemoryManagement<MEM_PER_SUBTREE>>
             sub_trees,
             memory_management,
             memory_allocators,
+            memory_allocator_idx: 0,
         }
+    }
+
+    pub fn allocate(&mut self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        for _ in 0..NUM_SUBTREES {
+            let idx = self.memory_allocator_idx % NUM_SUBTREES;
+            self.memory_allocator_idx += 1;
+
+            let allocator = &mut self.memory_allocators[idx];
+            match allocator.allocate(layout) {
+                Ok(mem) => return Ok(mem),
+                Err(_) => {
+                    /* Try next allocator */
+                    continue;
+                }
+            }
+        }
+
+        Err(AllocError)
+    }
+
+    pub unsafe fn deallocate(&mut self, ptr: NonNull<[u8]>, layout: Layout) {
+        assert!(ptr.addr() >= self.memory_management.start().addr());
+        let offset = ptr.addr().get() - self.memory_management.start().addr().get();
+
+        assert!(offset < TOTAL_MEM);
+        let idx = offset / MEM_PER_SUBTREE;
+
+        let allocator = &mut self.memory_allocators[idx];
+        unsafe { allocator.deallocate(ptr.cast(), layout) };
     }
 }
 
@@ -161,4 +196,31 @@ mod tests {
         let tree = MountableMerkleTree::<NodeAllocator, HeapMemory>::new();
         drop(tree);
     }
+
+    #[test]
+    fn allocate_wraps_the_round_robin_index_past_num_subtrees_calls() {
+        let mut tree = MountableMerkleTree::<NodeAllocator, HeapMemory>::new();
+        let layout = Layout::new::<[u8; 64]>();
+
+        // memory_allocator_idx keeps counting up across calls; this must
+        // still succeed well past NUM_SUBTREES calls instead of indexing
+        // memory_allocators out of bounds.
+        for _ in 0..(NUM_SUBTREES * 2 + 1) {
+            assert!(tree.allocate(layout).is_ok());
+        }
+    }
+
+    #[test]
+    fn deallocate_returns_memory_to_its_owning_subtree_allocator() {
+        let mut tree = MountableMerkleTree::<NodeAllocator, HeapMemory>::new();
+        let layout = Layout::new::<[u8; 64]>();
+
+        let mem = tree.allocate(layout).unwrap();
+        unsafe { tree.deallocate(mem, layout) };
+
+        // The freed block must be handed back out again rather than the
+        // allocator treating its region as still full.
+        assert!(tree.allocate(layout).is_ok());
+    }
 }
+
