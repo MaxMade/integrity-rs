@@ -3,8 +3,8 @@
 //!
 //! The protected region ([`TOTAL_MEM`] bytes) is divided into
 //! [`NUM_SUBTREES`] equal, [`MEM_PER_SUBTREE`]-sized sub-regions, each with
-//! its own [`MerkleTree`] ([`sub_trees`](MountableMerkleTree::sub_trees)) and
-//! its own [`BuddyAllocator`] serving allocations out of that sub-region.
+//! its own [`MerkleTree`] (a `sub_trees` entry) and its own
+//! [`BuddyAllocator`] serving allocations out of that sub-region.
 //! A single `root_tree` then covers an array of the sub-trees' *root
 //! digests* ([`MerkleTree::root_hash`]): whenever a sub-tree changes, its new
 //! root digest is republished into that array and hashed up through the root
@@ -49,8 +49,7 @@ pub const NUM_SUBTREES: usize = TOTAL_MEM / MEM_PER_SUBTREE;
 
 /// Size, in bytes, of the sub-region covered by a single leaf of one
 /// sub-tree — the granularity at which a sub-tree tracks integrity, and the
-/// size of the slice [`rehash`](MountableMerkleTree::rehash)/
-/// [`validate`](MountableMerkleTree::validate) hash per touched leaf.
+/// size of the slice `rehash`/`validate` hash per touched leaf.
 pub const MEM_PER_SUBTREE_LEAF: usize = MEM_PER_SUBTREE / merkle_tree::NUM_LEAF_NODES;
 
 /// Size, in bytes, of one entry of `sub_tree_hashes` (a BLAKE3 digest).
@@ -380,6 +379,23 @@ pub struct MountableMerkleTreeGuard<
 impl<'a, MTNA: MerkleTreeNodeAllocator, MM: MemoryManagement<MEM_PER_SUBTREE>, L: RawMutex, T>
     MountableMerkleTreeGuard<'a, MTNA, MM, L, T>
 {
+    /// The raw address of the protected value, an escape hatch for reads
+    /// that don't fit [`with`](Self::with) (FFI, `unsafe` field access, …).
+    ///
+    /// This bypasses the integrity machinery entirely: it takes no lock and
+    /// performs no validation, so unlike `with` a read through it is *not*
+    /// checked against the recorded hash. Reading is otherwise sound while
+    /// the guard is alive.
+    ///
+    /// Writing through it (via `*mut T`) is the documented way to *break*
+    /// the invariant — the tree is never told the memory changed, so the
+    /// recorded hash goes stale and the next [`with`](Self::with) /
+    /// [`with_mut`](Self::with_mut) panics. Mutate through
+    /// [`with_mut`](Self::with_mut) instead, which re-hashes afterwards.
+    pub fn as_ptr(&self) -> *const T {
+        self.ptr.as_ptr()
+    }
+
     /// Validate the stored value, copy it out, and run `cb` against that
     /// copy — with the lock released for the duration of `cb`.
     ///
@@ -391,8 +407,7 @@ impl<'a, MTNA: MerkleTreeNodeAllocator, MM: MemoryManagement<MEM_PER_SUBTREE>, L
     ///
     /// # Panics
     ///
-    /// Panics if the value fails its integrity check (see
-    /// [`MountableMerkleTree::validate`]).
+    /// Panics if the value fails its integrity check.
     pub fn with<R, CB: FnOnce(&T) -> R>(&self, cb: CB) -> R
     where
         T: Copy,
