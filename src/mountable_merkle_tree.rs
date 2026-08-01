@@ -6,15 +6,30 @@
 //! its own [`MerkleTree`] (a `sub_trees` entry) and its own
 //! [`BuddyAllocator`] serving allocations out of that sub-region.
 //! A single `root_tree` then covers an array of the sub-trees' *root
-//! digests* ([`MerkleTree::root_hash`]): whenever a sub-tree changes, its new
-//! root digest is republished into that array and hashed up through the root
-//! tree, so the root digest transitively attests to every sub-tree, and
+//! digests* ([`MerkleTree::root_digest`]): whenever a sub-tree changes, its
+//! new root digest is republished into that array and hashed up through the
+//! root tree, so the root digest transitively attests to every sub-tree, and
 //! therefore to every byte any of them cover. (Hashing the digests, rather
 //! than the `MerkleTree` structs, is essential — a re-hash changes a
 //! sub-tree's nodes, not its struct bytes.) Integrity metadata thus scales
 //! with the memory actually in use (sub-trees only materialize nodes for
 //! regions that have been touched — see [`MerkleTree::leaf_node`]) rather
 //! than with [`TOTAL_MEM`].
+//!
+//! What gets published is [`root_digest`](MerkleTree::root_digest), not
+//! [`root_hash`](MerkleTree::root_hash), so that a sub-tree's *version* is
+//! attested along with its contents. A sub-tree's major counter lives in the
+//! `MerkleTree` struct, which no node hashes, so publishing the bare root
+//! hash would let a whole sub-region be rolled back to a state it held under
+//! an earlier major without the digest moving.
+//!
+//! That recursion has to stop somewhere: the `root_tree`'s own major has no
+//! level above it to be published into, so nothing here attests it. Closing
+//! that last step needs a freshness anchor outside this structure — storage
+//! an attacker cannot roll back, holding the last-seen top-level digest.
+//! Until then the tree detects tampering, but a rollback of the *entire*
+//! structure — protected memory, nodes and digests together — still
+//! validates.
 //!
 //! [`LockedMountableMerkleTree`] wraps the whole structure in a mutex and
 //! hands out [`MountableMerkleTreeGuard`]s that re-validate on read and
@@ -27,7 +42,7 @@ use core::ffi::c_void;
 use core::ptr::NonNull;
 
 use crate::{
-    buddy_allocator::BuddyAllocator,
+    buddy_allocator::{BuddyAllocator, MIN_ALLOC_SIZE},
     memory::MemoryManagement,
     merkle_tree::{self, MerkleTree, MerkleTreeNodeAllocator},
 };
@@ -62,6 +77,9 @@ const ROOT_TREE_SIZE: usize = NUM_SUBTREES * DIGEST_SIZE;
 /// Bytes of `sub_tree_hashes` covered by a single root-tree leaf.
 const ROOT_TREE_LEAF: usize = ROOT_TREE_SIZE / merkle_tree::NUM_LEAF_NODES;
 
+const BUDDY_ALLOCATOR_HEIGHT: usize =
+    usize::ilog2(MEM_PER_SUBTREE_LEAF / MIN_ALLOC_SIZE) as usize + 1;
+
 /// One sub-tree's published root digest. Over-aligned so the
 /// `sub_tree_hashes` array starts on an even address, which
 /// [`MerkleTree`] requires of the region it covers.
@@ -83,8 +101,8 @@ pub struct MountableMerkleTree<MTNA: MerkleTreeNodeAllocator, MM: MemoryManageme
     sub_trees: Box<[MerkleTree<MTNA>]>,
 
     /// `sub_tree_hashes[i]` is the last published root digest of
-    /// `sub_trees[i]` (see [`MerkleTree::root_hash`]). This is the array the
-    /// `root_tree` actually covers, so re-hashing it after a sub-tree
+    /// `sub_trees[i]` (see [`MerkleTree::root_digest`]). This is the array
+    /// the `root_tree` actually covers, so re-hashing it after a sub-tree
     /// changes carries that change up into the root digest — the bytes of
     /// the `sub_trees` structs themselves never change on a re-hash and so
     /// could not serve this purpose.
@@ -99,7 +117,7 @@ pub struct MountableMerkleTree<MTNA: MerkleTreeNodeAllocator, MM: MemoryManageme
 
     /// One buddy allocator per sub-region, each `fill`ed with exactly that
     /// sub-region's [`MEM_PER_SUBTREE`] bytes.
-    memory_allocators: Box<[BuddyAllocator<16>]>,
+    memory_allocators: Box<[BuddyAllocator<BUDDY_ALLOCATOR_HEIGHT>]>,
 }
 
 impl<MTNA: MerkleTreeNodeAllocator, MM: MemoryManagement<MEM_PER_SUBTREE>>
@@ -128,12 +146,16 @@ impl<MTNA: MerkleTreeNodeAllocator, MM: MemoryManagement<MEM_PER_SUBTREE>>
             })
             .collect();
 
-        // Published sub-tree digests, all-zero to start (matching every
-        // sub-tree's initial empty `root_hash`). This — not the `sub_trees`
-        // struct array — is what `root_tree` covers, so that re-hashing it
-        // after a sub-tree changes actually moves the root digest.
-        let sub_tree_hashes: Box<[Digest]> =
-            alloc::vec![Digest([0; DIGEST_SIZE]); NUM_SUBTREES].into_boxed_slice();
+        // Published sub-tree digests, seeded from the sub-trees themselves so
+        // the array agrees with them from the outset. This — not the
+        // `sub_trees` struct array — is what `root_tree` covers, so that
+        // re-hashing it after a sub-tree changes actually moves the root
+        // digest. Note these are not all-zero: an empty tree's `root_digest`
+        // still hashes its major over the zeroed root hash.
+        let sub_tree_hashes: Box<[Digest]> = sub_trees
+            .iter()
+            .map(|sub_tree| Digest(sub_tree.root_digest()))
+            .collect();
 
         let root_tree = MerkleTree::constructed(
             NonNull::new(sub_tree_hashes.as_ptr() as *mut c_void).unwrap(),
@@ -142,7 +164,7 @@ impl<MTNA: MerkleTreeNodeAllocator, MM: MemoryManagement<MEM_PER_SUBTREE>>
 
         // One buddy allocator per sub-region, each fed exactly that
         // sub-region's bytes.
-        let memory_allocators: Box<[BuddyAllocator<16>]> = (0..NUM_SUBTREES)
+        let memory_allocators: Box<[BuddyAllocator<BUDDY_ALLOCATOR_HEIGHT>]> = (0..NUM_SUBTREES)
             .map(|i| {
                 let mut allocator = BuddyAllocator::new();
                 let ptr = unsafe { memory_management.start().byte_add(i * MEM_PER_SUBTREE) };
@@ -262,8 +284,10 @@ impl<MTNA: MerkleTreeNodeAllocator, MM: MemoryManagement<MEM_PER_SUBTREE>>
         unsafe { self.sub_trees[idx].rehash(leaf, MEM_PER_SUBTREE_LEAF) };
 
         // Publish the sub-tree's new root digest into the array the root
-        // tree covers, then re-hash the root leaf holding it.
-        let digest = self.sub_trees[idx].root_hash();
+        // tree covers, then re-hash the root leaf holding it. `root_digest`
+        // rather than `root_hash`, so the sub-tree's major counter travels up
+        // with its contents.
+        let digest = self.sub_trees[idx].root_digest();
         self.sub_tree_hashes[idx] = Digest(digest);
 
         let root_leaf = self.root_leaf(idx);
@@ -294,7 +318,8 @@ impl<MTNA: MerkleTreeNodeAllocator, MM: MemoryManagement<MEM_PER_SUBTREE>>
     /// Verify the integrity of the leaf covering `ptr`, all the way to the
     /// root digest: the sub-tree leaf must still match memory and be
     /// internally consistent, its published digest must still equal the
-    /// sub-tree's current root, and the root tree must be internally
+    /// sub-tree's current [`root_digest`](MerkleTree::root_digest) — version
+    /// included, not just contents — and the root tree must be internally
     /// consistent over `sub_tree_hashes`.
     ///
     /// # Panics
@@ -314,7 +339,7 @@ impl<MTNA: MerkleTreeNodeAllocator, MM: MemoryManagement<MEM_PER_SUBTREE>>
             panic!("sub-tree {idx} failed integrity check");
         }
 
-        if self.sub_tree_hashes[idx].0 != self.sub_trees[idx].root_hash() {
+        if self.sub_tree_hashes[idx].0 != self.sub_trees[idx].root_digest() {
             panic!("sub-tree {idx} digest out of sync with root tree");
         }
 
@@ -678,6 +703,64 @@ mod tests {
         unsafe { ptr.write(2) };
 
         tree.validate(ptr.cast());
+    }
+
+    #[test]
+    fn published_digests_cover_the_sub_tree_version() {
+        let mut tree = MountableMerkleTree::<NodeAllocator, HeapMemory>::new();
+        let ptr = allocate_and_record(&mut tree, 1);
+        let (idx, _) = tree.subtree_leaf(ptr.cast());
+
+        // What gets published must be the sub-tree's full attestation, not
+        // its bare root hash — the latter leaves the major counter, and so
+        // any rollback across an epoch, unattested.
+        assert_eq!(
+            tree.sub_tree_hashes[idx].0,
+            tree.sub_trees[idx].root_digest()
+        );
+        assert_ne!(tree.sub_tree_hashes[idx].0, tree.sub_trees[idx].root_hash());
+
+        // The seeded array agrees with its sub-trees before anything is
+        // written too, so the invariant holds from construction.
+        let fresh = MountableMerkleTree::<NodeAllocator, HeapMemory>::new();
+        for i in [0, 1, NUM_SUBTREES - 1] {
+            assert_eq!(fresh.sub_tree_hashes[i].0, fresh.sub_trees[i].root_digest());
+        }
+    }
+
+    #[test]
+    fn validation_survives_a_sub_tree_changing_epoch() {
+        let mut tree = MountableMerkleTree::<NodeAllocator, HeapMemory>::new();
+
+        // A live value in sub-region 0, plus churn pinned to that same region
+        // so its leaves are re-hashed often enough to wrap a minor counter.
+        // Every allocate and deallocate re-hashes all 8 leaves, so this
+        // crosses at least one epoch.
+        let ptr = {
+            tree.memory_allocator_idx = 0;
+            let ptr = tree.allocate(Layout::new::<u64>()).unwrap().cast::<u64>();
+            unsafe { ptr.write(0xfeed) };
+            tree.rehash(ptr.cast());
+            ptr
+        };
+        let layout = Layout::new::<[u8; 64]>();
+        for _ in 0..200 {
+            tree.memory_allocator_idx = 0;
+            let mem = tree.allocate(layout).unwrap();
+            unsafe { tree.deallocate(mem, layout) };
+        }
+
+        assert!(
+            tree.sub_trees[0].major() > 0,
+            "churn did not cross an epoch; the test no longer exercises one"
+        );
+        assert!(tree.root_tree.major() > 0);
+
+        // The epoch change re-recorded every leaf of the sub-tree and
+        // republished its digest, so the original value still validates all
+        // the way up.
+        tree.validate(ptr.cast());
+        assert_eq!(unsafe { ptr.read() }, 0xfeed);
     }
 
     #[test]

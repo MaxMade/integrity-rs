@@ -32,6 +32,8 @@ struct LinkedListNode {
 
 type LinkedListNodePtr = Option<NonNull<LinkedListNode>>;
 
+pub const MIN_ALLOC_SIZE: usize = core::mem::size_of::<LinkedListNode>();
+
 /// Insert `node` at the front of the list rooted at `head`.
 unsafe fn list_push(head: &mut LinkedListNodePtr, mut node: NonNull<LinkedListNode>) {
     unsafe {

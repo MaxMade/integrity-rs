@@ -22,8 +22,13 @@
 //! dereference) and hash them with BLAKE3, rather than taking a
 //! caller-supplied hash: `rehash` records what the covered memory currently
 //! contains, and `validate` reports whether it still does. Every ancestor's
-//! hash is `blake3(left.hash || right.hash)`, so it commits to the content
-//! of every leaf hash below it.
+//! hash is `blake3(left.hash || left.minor || right.hash || right.minor)`,
+//! so it commits to the content of every leaf below it and to the version
+//! each of those leaves was last recorded at. The node links are not hashed:
+//! that would fold raw allocator addresses into every digest, making a root
+//! depend on where its nodes were placed. The tree's shape is therefore
+//! unattested — two same-hash siblings can be swapped without an ancestor
+//! noticing.
 //!
 //! Node storage is decoupled from the tree logic via the
 //! [`MerkleTreeNodeAllocator`] trait, so callers can back the tree with
@@ -49,6 +54,19 @@ pub const NUM_NODES: usize = (1 << HEIGHT) - 1;
 /// Number of leaf nodes in a complete binary tree of `HEIGHT` levels.
 pub const NUM_LEAF_NODES: usize = 1 << (HEIGHT - 1);
 
+/// The per-tree half of a leaf's version, shared by every leaf of one
+/// [`MerkleTree`] and bumped only when some leaf's [`MinorCounter`] wraps.
+pub type MajorCounter = u64;
+
+/// The per-leaf half of a leaf's version, bumped on every
+/// [`rehash`](MerkleTree::rehash) of that leaf.
+///
+/// Narrow by design: the point of splitting the version is that the wide half
+/// is stored once per tree instead of once per leaf. The cost is that
+/// wrapping is routine rather than unreachable — see
+/// [`rehash`](MerkleTree::rehash) for what has to happen then.
+pub type MinorCounter = u8;
+
 /// A single node of a [`MerkleTree`].
 ///
 /// `left` and `right` are `None` for leaves and for nodes that have not yet
@@ -59,9 +77,66 @@ pub struct MerkleTreeNode {
     right: Option<MerkleTreeNodePtr>,
     parent: Option<MerkleTreeNodePtr>,
     hash: [u8; 32],
+
+    /// This leaf's share of its version — see [`MinorCounter`]. Only
+    /// meaningful on leaves; inner nodes carry it (and commit to it, via
+    /// [`hash_state`](MerkleTreeNode::hash_state)) but never advance it.
+    minor: MinorCounter,
 }
 
 type MerkleTreeNodePtr = NonNull<MerkleTreeNode>;
+
+impl MerkleTreeNode {
+    /// Feed the part of this node's state a parent commits to into `hasher`:
+    /// its `hash`, followed by its `minor` counter.
+    ///
+    /// Carrying `minor` keeps a leaf's version attested: the counter sits in
+    /// untrusted memory alongside everything else, so an attacker rolling a
+    /// leaf back would roll its counter back too — and because the parent
+    /// commits to it, that moves the parent's hash.
+    ///
+    /// The `left`, `right` and `parent` links are deliberately *not* hashed,
+    /// even though they are part of the node. Doing so would fold raw
+    /// allocator addresses into every digest, making a tree's root a function
+    /// of where its nodes happen to have been placed rather than of the
+    /// memory it protects — so the same contents would attest differently on
+    /// every run. The cost is that the tree's shape is unattested: two
+    /// same-hash siblings can be swapped, or a node re-pointed at another
+    /// subtree, without an ancestor noticing.
+    ///
+    /// The fields are serialized one by one rather than hashing the struct's
+    /// bytes wholesale, so the digest doesn't depend on the layout
+    /// `repr(Rust)` happens to pick and no padding is ever read.
+    fn hash_state(&self, hasher: &mut blake3::Hasher) {
+        hasher.update(&self.hash);
+        hasher.update(&self.minor.to_ne_bytes());
+    }
+
+    /// The hash this node must carry as an inner node: BLAKE3 over its left
+    /// child's [`hash_state`](Self::hash_state) followed by its right
+    /// child's (a child contributes nothing if that side of the tree hasn't
+    /// been materialized yet — see [`MerkleTree::leaf_node`]).
+    ///
+    /// [`rehash`](MerkleTree::rehash) stores this into every ancestor it
+    /// walks through; [`validate`](MerkleTree::validate) compares it against
+    /// what is stored.
+    ///
+    /// # Safety
+    ///
+    /// This node's `left` and `right`, where set, must point to nodes valid
+    /// for reads.
+    unsafe fn inner_hash(&self) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+
+        for child in [self.left, self.right] {
+            if let Some(child) = child {
+                unsafe { child.as_ref().hash_state(&mut hasher) };
+            }
+        }
+
+        *hasher.finalize().as_bytes()
+    }
+}
 
 /// Backing storage for [`MerkleTreeNode`]s.
 ///
@@ -88,6 +163,17 @@ pub struct MerkleTree<A: MerkleTreeNodeAllocator> {
     ptr: NonNull<c_void>,
     size: usize,
     root: Option<MerkleTreeNodePtr>,
+
+    /// The wide half of every leaf's version — see [`MajorCounter`]. Held
+    /// once here rather than once per leaf, which is the whole point of
+    /// splitting the counter.
+    ///
+    /// Unlike the per-leaf `minor`, this lives outside the tree it versions,
+    /// so nothing in the tree attests to it: a higher level must publish
+    /// [`root_digest`](Self::root_digest), not
+    /// [`root_hash`](Self::root_hash), for it to be covered.
+    major: MajorCounter,
+
     phantom: PhantomData<A>,
 }
 
@@ -119,6 +205,7 @@ impl<A: MerkleTreeNodeAllocator> MerkleTree<A> {
             ptr,
             size,
             root: None,
+            major: 0,
             phantom: PhantomData,
         }
     }
@@ -141,6 +228,7 @@ impl<A: MerkleTreeNodeAllocator> MerkleTree<A> {
             node.right = None;
             node.parent = None;
             node.hash = [0; 32];
+            node.minor = 0;
         }
 
         node
@@ -180,7 +268,140 @@ impl<A: MerkleTreeNodeAllocator> MerkleTree<A> {
             ptr,
             size,
             root: nodes[0],
+            major: 0,
             phantom: PhantomData,
+        }
+    }
+
+    /// The base address of the leaf covering `ptr` — the same address
+    /// [`leaf_node`](Self::leaf_node) arrives at by halving its way down, but
+    /// computed directly, since a leaf is just a fixed-size slice of the
+    /// region.
+    ///
+    /// Only meaningful for a `ptr` inside this tree's region; callers get
+    /// that by having already resolved `ptr` through `leaf_node`.
+    fn leaf_base(&self, ptr: NonNull<u8>) -> usize {
+        let start = self.ptr.addr().get();
+        let leaf_size = self.size / NUM_LEAF_NODES;
+
+        start + ((ptr.addr().get() - start) / leaf_size) * leaf_size
+    }
+
+    /// The hash a leaf must carry: BLAKE3 over its version — this tree's
+    /// [`major`](MajorCounter) and the leaf's own [`minor`](MinorCounter) —
+    /// then the leaf's base address, then the `size` bytes at `ptr`.
+    ///
+    /// The version is what makes the digest unrepeatable, so restoring a
+    /// leaf's old contents no longer reproduces its old hash. The address
+    /// binds the digest to *where* the bytes live, so a leaf cannot be
+    /// spliced in somewhere else.
+    ///
+    /// # Safety
+    ///
+    /// `[ptr, ptr + size)` must be valid for reads for the duration of this
+    /// call (see [`slice::from_raw_parts`]).
+    unsafe fn leaf_hash(&self, ptr: NonNull<u8>, size: usize, minor: MinorCounter) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+
+        hasher.update(&self.major.to_ne_bytes());
+        hasher.update(&minor.to_ne_bytes());
+        hasher.update(&self.leaf_base(ptr).to_ne_bytes());
+        unsafe { hasher.update(slice::from_raw_parts(ptr.as_ptr(), size)) };
+
+        *hasher.finalize().as_bytes()
+    }
+
+    /// Start a fresh [`major`](MajorCounter) and re-record every leaf under
+    /// it, restarting their [`minor`](MinorCounter) counters at 1.
+    ///
+    /// This is what a minor counter wrapping costs. The major is shared by
+    /// the whole tree, so bumping it re-versions every leaf at once and
+    /// invalidates every hash recorded against the old major — each one has
+    /// to be recomputed from the memory it covers, and every inner node
+    /// recomputed above them. Only leaves that were actually recorded (a
+    /// non-zero `minor`) are touched: a leaf nothing was ever `rehash`ed
+    /// through stays unrecorded rather than being silently blessed with
+    /// whatever its memory currently holds.
+    ///
+    /// Together with the strictly increasing major, restarting the minors at
+    /// 1 keeps every leaf's `(major, minor)` pair strictly increasing, so no
+    /// leaf ever republishes a version — which is the property the whole
+    /// split-counter scheme exists to provide.
+    ///
+    /// Re-recording is at whole-leaf granularity, since the tree does not
+    /// remember which sub-range of a leaf a caller last passed to
+    /// [`rehash`](Self::rehash).
+    ///
+    /// # Safety
+    ///
+    /// Every leaf previously recorded through [`rehash`](Self::rehash) is
+    /// re-read in full, so the whole leaf-sized slice around each such range
+    /// must still be valid for reads.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the major counter is exhausted, which at `u64` takes more
+    /// re-hashes than the machine can perform.
+    unsafe fn begin_new_major(&mut self) {
+        self.major = self
+            .major
+            .checked_add(1)
+            .expect("MerkleTree major counter exhausted");
+
+        let Some(root) = self.root else { return };
+
+        // Collect the materialized nodes breadth-first, carrying each one's
+        // depth and the base of the region it covers — a leaf needs the base
+        // to know which bytes to re-read, and the depth is what distinguishes
+        // a real leaf from an inner node whose children simply aren't
+        // materialized yet.
+        let mut queue = [None; NUM_NODES];
+        queue[0] = Some((root, self.ptr.addr().get(), 0usize));
+        let mut len = 1;
+        let mut idx = 0;
+        while idx < len {
+            let (node, base, depth) = queue[idx].unwrap();
+            idx += 1;
+
+            if depth == HEIGHT - 1 {
+                continue;
+            }
+
+            let (left, right) = unsafe { (node.as_ref().left, node.as_ref().right) };
+            let half = (self.size >> depth) / 2;
+            for (child, base) in [(left, base), (right, base + half)] {
+                if let Some(child) = child {
+                    queue[len] = Some((child, base, depth + 1));
+                    len += 1;
+                }
+            }
+        }
+
+        // Walk that back to front: breadth-first order puts every parent
+        // before its children, so reversing it recomputes each inner node
+        // only once its children are already up to date.
+        let leaf_size = self.size / NUM_LEAF_NODES;
+        for entry in queue[..len].iter().rev() {
+            let (mut node, base, depth) = entry.unwrap();
+
+            if depth < HEIGHT - 1 {
+                let hash = unsafe { node.as_ref().inner_hash() };
+                unsafe { node.as_mut().hash = hash };
+                continue;
+            }
+
+            // A leaf nothing was ever recorded through has nothing to
+            // re-record, and must not start matching its memory now.
+            if unsafe { node.as_ref().minor } == 0 {
+                continue;
+            }
+
+            let ptr = unsafe { NonNull::new_unchecked(base as *mut u8) };
+            let hash = unsafe { self.leaf_hash(ptr, leaf_size, 1) };
+            unsafe {
+                node.as_mut().minor = 1;
+                node.as_mut().hash = hash;
+            }
         }
     }
 
@@ -257,21 +478,36 @@ impl<A: MerkleTreeNodeAllocator> MerkleTree<A> {
         Some(node)
     }
 
-    /// Hash the `size` bytes at `ptr` with BLAKE3 and record the result as
-    /// the hash of the leaf covering that range, then recompute the hash of
-    /// every ancestor up to the root — allocating any node along that path
-    /// that isn't linked yet (see [`leaf_node`](Self::leaf_node)).
+    /// Advance the version of the leaf covering `[ptr, ptr + size)`, hash the
+    /// `size` bytes at `ptr` together with that version, record the result as
+    /// the leaf's hash, then recompute the hash of every ancestor up to the
+    /// root — allocating any node along that path that isn't linked yet (see
+    /// [`leaf_node`](Self::leaf_node)).
     ///
-    /// Each internal node's hash is `blake3(left.hash || right.hash)` (a
-    /// child contributes nothing if that side of the tree hasn't been
-    /// touched yet). This makes every node's hash a pure function of the
-    /// memory contents in its subtree at the time of the last `rehash` call
-    /// covering each leaf.
+    /// The leaf's hash is BLAKE3 over `major || minor || leaf_base || memory`
+    /// (see [`leaf_hash`](Self::leaf_hash)); each internal node's is BLAKE3
+    /// over its children's hashes and `minor` counters (a child contributes
+    /// nothing if that side of the tree hasn't been touched yet). Every
+    /// node's hash is therefore a pure function of the memory contents in its
+    /// subtree *and* how many times each of those leaves has been re-hashed —
+    /// so restoring a leaf's old bytes no longer restores its old hash.
+    ///
+    /// Once this leaf's minor counter wraps, the whole tree moves to a fresh
+    /// major and every recorded leaf is re-read and re-recorded under it —
+    /// see [`begin_new_major`](Self::begin_new_major). That is the cost the
+    /// split buys back: a narrow per-leaf counter in exchange for an
+    /// occasional pass over the whole region.
     ///
     /// # Safety
     ///
     /// `[ptr, ptr + size)` must be valid for reads for the duration of this
     /// call (see [`slice::from_raw_parts`]).
+    ///
+    /// On the wrap described above this call also re-reads *every* leaf ever
+    /// recorded in this tree, in full, so the whole leaf-sized slice around
+    /// each such range must still be valid for reads too. Any caller that
+    /// hands a region to `rehash` and later unmaps part of it violates this,
+    /// even though the offending call names only the range it passed.
     ///
     /// # Panics
     ///
@@ -285,15 +521,29 @@ impl<A: MerkleTreeNodeAllocator> MerkleTree<A> {
             None => panic!("Unable to find leaf node for address ({:p})", ptr),
         };
 
-        // Calculate hash
-        let mut hash = blake3::Hasher::new();
-        unsafe { hash.update(slice::from_raw_parts(ptr.as_ptr(), size)) };
-        let hash = hash.finalize();
+        // Advance this leaf's version, so the hash below cannot repeat one
+        // this leaf has already published for the same contents. A wrap would
+        // repeat it, so instead the whole tree moves to a fresh major.
+        let minor = unsafe {
+            match node.as_ref().minor.checked_add(1) {
+                Some(minor) => {
+                    node.as_mut().minor = minor;
+                    minor
+                }
+                None => {
+                    self.begin_new_major();
+                    node.as_ref().minor
+                }
+            }
+        };
+
+        // Calculate hash over the new version, the leaf's address, and memory
+        let hash = unsafe { self.leaf_hash(ptr, size, minor) };
 
         // Update hash of leaf node
         let mut drag = unsafe {
             let node = node.as_mut();
-            node.hash.copy_from_slice(hash.as_bytes());
+            node.hash = hash;
             node.parent
         };
 
@@ -301,21 +551,9 @@ impl<A: MerkleTreeNodeAllocator> MerkleTree<A> {
         while let Some(mut node) = drag {
             unsafe {
                 let node = node.as_mut();
-                let mut hasher = blake3::Hasher::new();
 
-                // Process left child
-                if let Some(child) = node.left {
-                    hasher.update(child.as_ref().hash.as_slice());
-                }
-
-                // Process right child
-                if let Some(child) = node.right {
-                    hasher.update(child.as_ref().hash.as_slice());
-                }
-
-                // Update hash
-                let hash = hasher.finalize();
-                node.hash.copy_from_slice(hash.as_bytes());
+                // Update hash over both children's full state
+                node.hash = node.inner_hash();
 
                 // Continue with parent
                 drag = node.parent;
@@ -326,12 +564,17 @@ impl<A: MerkleTreeNodeAllocator> MerkleTree<A> {
     /// Hash the `size` bytes at `ptr` with BLAKE3 and check that it matches
     /// the cached hash of the leaf covering that range, and that every
     /// ancestor's cached hash up to the root is consistent with its children
-    /// (i.e. still equals `blake3(left.hash || right.hash)`).
+    /// (i.e. still equals BLAKE3 over both children's hashes and counters).
     ///
-    /// This recomputes the leaf hash from the current memory contents but
-    /// does not update anything: it catches both memory that has changed
-    /// since the last [`rehash`](Self::rehash) of this leaf, and any node's
-    /// cached hash having been corrupted directly. Note that it still takes
+    /// This recomputes the leaf hash from the current memory contents and the
+    /// leaf's *current* version — it never advances a counter, so validating
+    /// is idempotent and two `validate`s around a `rehash` differ. It catches
+    /// memory that has changed since the last [`rehash`](Self::rehash) of
+    /// this leaf, any node's cached hash having been corrupted directly,
+    /// and — because the ancestor check covers the children's counters as
+    /// well as their hashes — a leaf's version having been rolled back
+    /// underneath it. It does *not* catch the tree being re-linked, since the
+    /// links are not hashed. Note that it still takes
     /// `&mut self`: like `rehash`, it allocates any node along the way that
     /// isn't linked yet (see [`leaf_node`](Self::leaf_node)) — which, for a
     /// range that was never `rehash`ed, just means it reliably returns
@@ -355,17 +598,16 @@ impl<A: MerkleTreeNodeAllocator> MerkleTree<A> {
             None => panic!("Unable to find leaf node for address ({:p})", ptr),
         };
 
-        // Calculate hash
-        let mut hash = blake3::Hasher::new();
-        unsafe { hash.update(slice::from_raw_parts(ptr.as_ptr(), size)) };
-        let hash = hash.finalize();
+        // Calculate hash against the leaf's current version, without
+        // advancing it
+        let hash = unsafe { self.leaf_hash(ptr, size, node.as_ref().minor) };
 
         // Check leaf node
         let mut drag = unsafe {
             let node = node.as_ref();
 
             // Error: hashes didn't match...
-            if node.hash != *hash.as_bytes() {
+            if node.hash != hash {
                 return false;
             }
 
@@ -376,22 +618,9 @@ impl<A: MerkleTreeNodeAllocator> MerkleTree<A> {
         while let Some(node) = drag {
             unsafe {
                 let node = node.as_ref();
-                let mut hasher = blake3::Hasher::new();
-
-                // Process left child
-                if let Some(child) = node.left {
-                    hasher.update(child.as_ref().hash.as_slice());
-                }
-
-                // Process right child
-                if let Some(child) = node.right {
-                    hasher.update(child.as_ref().hash.as_slice());
-                }
-
-                let hash = hasher.finalize();
 
                 // Error: hashes didn't match...
-                if node.hash != *hash.as_bytes() {
+                if node.hash != node.inner_hash() {
                     return false;
                 }
 
@@ -408,14 +637,45 @@ impl<A: MerkleTreeNodeAllocator> MerkleTree<A> {
     /// [`empty`](Self::empty) tree, or one nothing has been
     /// [`rehash`](Self::rehash)ed through).
     ///
-    /// This is the value a higher-level tree hashes to attest to this one:
-    /// it changes whenever any covered leaf is re-hashed, unlike the bytes
-    /// of the `MerkleTree` struct itself.
+    /// It changes whenever any covered leaf is re-hashed, unlike the bytes of
+    /// the `MerkleTree` struct itself. It does *not* cover
+    /// [`major`](MajorCounter), which lives in that struct rather than in the
+    /// tree — use [`root_digest`](Self::root_digest) for that.
     pub fn root_hash(&self) -> [u8; 32] {
         match self.root {
             Some(root) => unsafe { root.as_ref().hash },
             None => [0; 32],
         }
+    }
+
+    /// This tree's current epoch — the [`MajorCounter`] every leaf's version
+    /// is taken against, advanced whenever some leaf's minor counter wraps
+    /// (see [`rehash`](Self::rehash)).
+    ///
+    /// Exposed so a caller managing freshness can observe how far the tree
+    /// has advanced; it is already folded into
+    /// [`root_digest`](Self::root_digest), which is what should actually be
+    /// published.
+    pub fn major(&self) -> MajorCounter {
+        self.major
+    }
+
+    /// This tree's full attestation: BLAKE3 over its
+    /// [`major`](MajorCounter) counter and its
+    /// [`root_hash`](Self::root_hash).
+    ///
+    /// This — not `root_hash` — is what a higher-level tree should publish to
+    /// attest to this one. `major` is held in the `MerkleTree` struct, which
+    /// no node hashes, so a `root_hash` alone leaves it unattested: an
+    /// attacker could roll a whole tree back to a state it held under an
+    /// earlier major and the digest would not move.
+    pub fn root_digest(&self) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+
+        hasher.update(&self.major.to_ne_bytes());
+        hasher.update(&self.root_hash());
+
+        *hasher.finalize().as_bytes()
     }
 }
 
@@ -475,6 +735,7 @@ mod imp {
                 right: None,
                 parent: None,
                 hash: [0; 32],
+                minor: 0,
             });
             Ok(NonNull::from(Box::leak(node)))
         }
@@ -774,6 +1035,28 @@ mod tests {
         }
     }
 
+    /// Recompute a leaf's hash exactly the way `leaf_hash` is specified to:
+    /// the tree's major, the leaf's minor, the leaf's base address, then the
+    /// covered memory. Spelled out here rather than calling `leaf_hash` so
+    /// the tests pin the preimage down independently of the implementation.
+    #[cfg(feature = "std")]
+    fn expected_leaf_hash(
+        major: MajorCounter,
+        minor: MinorCounter,
+        base: usize,
+        ptr: NonNull<u8>,
+        size: usize,
+    ) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+
+        hasher.update(&major.to_ne_bytes());
+        hasher.update(&minor.to_ne_bytes());
+        hasher.update(&base.to_ne_bytes());
+        hasher.update(unsafe { slice::from_raw_parts(ptr.as_ptr(), size) });
+
+        *hasher.finalize().as_bytes()
+    }
+
     #[cfg(feature = "std")]
     #[test]
     fn rehash_sets_the_leaf_hash() {
@@ -786,17 +1069,33 @@ mod tests {
 
         unsafe { tree.rehash(region.byte_ptr(0), LEAF_SIZE) };
 
-        let expected =
-            *blake3::hash(unsafe { slice::from_raw_parts(region.byte_ptr(0).as_ptr(), LEAF_SIZE) })
-                .as_bytes();
+        // A first rehash leaves the leaf at minor 1, under the tree's initial
+        // major of 0.
+        let expected = expected_leaf_hash(0, 1, START, region.byte_ptr(0), LEAF_SIZE);
 
         let leaf = tree.leaf_node(region.byte_ptr(0), LEAF_SIZE).unwrap();
         assert_eq!(unsafe { leaf.as_ref().hash }, expected);
+        assert_eq!(unsafe { leaf.as_ref().minor }, 1);
+    }
+
+    /// Serialize a node exactly the way `hash_state` is specified to: its
+    /// hash, then its minor counter. Spelled out here rather than calling
+    /// `hash_state` so the tests pin the wire format down independently of
+    /// the implementation.
+    #[cfg(feature = "std")]
+    fn expected_state(node: MerkleTreeNodePtr) -> std::vec::Vec<u8> {
+        let node = unsafe { node.as_ref() };
+
+        let mut state = std::vec::Vec::new();
+        state.extend_from_slice(&node.hash);
+        state.extend_from_slice(&node.minor.to_ne_bytes());
+
+        state
     }
 
     #[cfg(feature = "std")]
     #[test]
-    fn rehash_computes_ancestor_hashes_as_blake3_of_children() {
+    fn rehash_computes_ancestor_hashes_from_its_children() {
         const START: usize = 1 << 29;
         const SIZE: usize = 0x1000;
         const LEAF_SIZE: usize = SIZE / NUM_LEAF_NODES;
@@ -813,26 +1112,25 @@ mod tests {
             tree.rehash(region.byte_ptr(LEAF_SIZE), LEAF_SIZE);
         }
 
-        let left_hash =
-            *blake3::hash(unsafe { slice::from_raw_parts(region.byte_ptr(0).as_ptr(), LEAF_SIZE) })
-                .as_bytes();
-        let right_hash = *blake3::hash(unsafe {
-            slice::from_raw_parts(region.byte_ptr(LEAF_SIZE).as_ptr(), LEAF_SIZE)
-        })
-        .as_bytes();
+        let left = tree.leaf_node(region.byte_ptr(0), LEAF_SIZE).unwrap();
+        let right = tree
+            .leaf_node(region.byte_ptr(LEAF_SIZE), LEAF_SIZE)
+            .unwrap();
 
+        // Each leaf carries the hash of its version, address and memory...
+        for (leaf, offset) in [(left, 0), (right, LEAF_SIZE)] {
+            let expected =
+                expected_leaf_hash(0, 1, START + offset, region.byte_ptr(offset), LEAF_SIZE);
+            assert_eq!(unsafe { leaf.as_ref().hash }, expected);
+        }
+
+        // ...and their parent hashes both leaves' hash and counter.
         let mut hasher = blake3::Hasher::new();
-        hasher.update(&left_hash);
-        hasher.update(&right_hash);
+        hasher.update(&expected_state(left));
+        hasher.update(&expected_state(right));
         let expected = *hasher.finalize().as_bytes();
 
-        let parent = unsafe {
-            tree.leaf_node(region.byte_ptr(0), LEAF_SIZE)
-                .unwrap()
-                .as_ref()
-                .parent
-        }
-        .unwrap();
+        let parent = unsafe { left.as_ref().parent }.unwrap();
         assert_eq!(unsafe { parent.as_ref().hash }, expected);
     }
 
@@ -870,9 +1168,7 @@ mod tests {
         // whole root-to-leaf path on its own.
         unsafe { tree.rehash(region.byte_ptr(0), LEAF_SIZE) };
 
-        let expected =
-            *blake3::hash(unsafe { slice::from_raw_parts(region.byte_ptr(0).as_ptr(), LEAF_SIZE) })
-                .as_bytes();
+        let expected = expected_leaf_hash(0, 1, START, region.byte_ptr(0), LEAF_SIZE);
 
         let leaf = tree.leaf_node(region.byte_ptr(0), LEAF_SIZE).unwrap();
         assert_eq!(unsafe { leaf.as_ref().hash }, expected);
@@ -992,5 +1288,296 @@ mod tests {
         // Out of range: `leaf_node` returns `None` before this address is
         // ever dereferenced, so no real backing memory is needed.
         unsafe { tree.validate(byte_ptr(START + SIZE), 1) };
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn rehash_advances_the_leaf_version_and_validate_does_not() {
+        const START: usize = 1 << 37;
+        const SIZE: usize = 0x1000;
+        const LEAF_SIZE: usize = SIZE / NUM_LEAF_NODES;
+
+        let region = MappedRegion::new(START, SIZE);
+        let mut tree = MerkleTree::<NodeAllocator>::constructed(region.base(), SIZE);
+
+        let leaf = tree.leaf_node(region.byte_ptr(0), LEAF_SIZE).unwrap();
+        assert_eq!(unsafe { leaf.as_ref().minor }, 0);
+
+        for expected in 1..=3 {
+            unsafe { tree.rehash(region.byte_ptr(0), LEAF_SIZE) };
+            assert_eq!(unsafe { leaf.as_ref().minor }, expected);
+
+            // Validating must be idempotent — it reads the version, never
+            // advances it, so it can run any number of times between writes.
+            for _ in 0..3 {
+                assert!(unsafe { tree.validate(region.byte_ptr(0), LEAF_SIZE) });
+                assert_eq!(unsafe { leaf.as_ref().minor }, expected);
+            }
+        }
+
+        // Only the rehashed leaf's version moved.
+        let untouched = tree
+            .leaf_node(region.byte_ptr(LEAF_SIZE), LEAF_SIZE)
+            .unwrap();
+        assert_eq!(unsafe { untouched.as_ref().minor }, 0);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn rehash_gives_identical_leaves_different_hashes() {
+        const START: usize = 1 << 38;
+        const SIZE: usize = 0x1000;
+        const LEAF_SIZE: usize = SIZE / NUM_LEAF_NODES;
+
+        let region = MappedRegion::new(START, SIZE);
+        let mut tree = MerkleTree::<NodeAllocator>::constructed(region.base(), SIZE);
+
+        // Byte-for-byte identical content in two different leaves, both at
+        // the same version.
+        region.fill(0, LEAF_SIZE, 0x5a);
+        region.fill(LEAF_SIZE, LEAF_SIZE, 0x5a);
+        unsafe {
+            tree.rehash(region.byte_ptr(0), LEAF_SIZE);
+            tree.rehash(region.byte_ptr(LEAF_SIZE), LEAF_SIZE);
+        }
+
+        // The leaf base address is part of the preimage, so the two hashes
+        // must still differ — otherwise one leaf could be spliced in for the
+        // other.
+        let first = tree.leaf_node(region.byte_ptr(0), LEAF_SIZE).unwrap();
+        let second = tree
+            .leaf_node(region.byte_ptr(LEAF_SIZE), LEAF_SIZE)
+            .unwrap();
+        assert_ne!(unsafe { first.as_ref().hash }, unsafe {
+            second.as_ref().hash
+        });
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn returning_to_a_previous_state_does_not_reproduce_the_root_hash() {
+        const START: usize = 1 << 39;
+        const SIZE: usize = 0x1000;
+        const LEAF_SIZE: usize = SIZE / NUM_LEAF_NODES;
+
+        let region = MappedRegion::new(START, SIZE);
+        let mut tree = MerkleTree::<NodeAllocator>::constructed(region.base(), SIZE);
+
+        // Record state A, then B, then byte-for-byte back to A.
+        region.fill(0, LEAF_SIZE, 0xa1);
+        unsafe { tree.rehash(region.byte_ptr(0), LEAF_SIZE) };
+        let first = tree.root_hash();
+
+        region.fill(0, LEAF_SIZE, 0xb2);
+        unsafe { tree.rehash(region.byte_ptr(0), LEAF_SIZE) };
+        let second = tree.root_hash();
+
+        region.fill(0, LEAF_SIZE, 0xa1);
+        unsafe { tree.rehash(region.byte_ptr(0), LEAF_SIZE) };
+        let third = tree.root_hash();
+
+        // This is what the version buys. Hashing content alone makes the root
+        // a pure function of memory, so returning to A republishes A's exact
+        // digest — and an outside observer holding the last-seen digest
+        // cannot tell a rollback from a legitimate rewrite of the same value.
+        // The counter makes the digest sequence unrepeatable.
+        assert_ne!(third, first, "root hash must not repeat for repeated state");
+        assert_ne!(third, second);
+        assert_ne!(first, second);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn validate_is_false_when_a_leaf_version_was_rewound() {
+        const START: usize = 1 << 40;
+        const SIZE: usize = 0x1000;
+        const LEAF_SIZE: usize = SIZE / NUM_LEAF_NODES;
+
+        let region = MappedRegion::new(START, SIZE);
+        let mut tree = MerkleTree::<NodeAllocator>::constructed(region.base(), SIZE);
+
+        region.fill(0, LEAF_SIZE, 0xa1);
+        unsafe {
+            tree.rehash(region.byte_ptr(0), LEAF_SIZE);
+            tree.rehash(region.byte_ptr(0), LEAF_SIZE);
+        }
+        let mut leaf = tree.leaf_node(region.byte_ptr(0), LEAF_SIZE).unwrap();
+        assert_eq!(unsafe { leaf.as_ref().minor }, 2);
+
+        // Rewind the counter to set up a later replay. Nothing here is
+        // secret, so the attacker can re-derive the leaf's hash for the
+        // rewound version — which leaves the leaf wholly self-consistent, and
+        // the leaf-level check alone passes.
+        unsafe {
+            leaf.as_mut().minor = 1;
+            leaf.as_mut().hash = expected_leaf_hash(0, 1, START, region.byte_ptr(0), LEAF_SIZE);
+        }
+
+        // The parent is what catches it: `hash_state` folds the child's
+        // counter into the parent's hash, so a rewind moves the parent's
+        // digest even though the leaf still checks out against itself.
+        assert!(!unsafe { tree.validate(region.byte_ptr(0), LEAF_SIZE) });
+    }
+
+    /// Rehash `leaf` enough times to wrap its minor counter exactly once,
+    /// varying the content so the writes are not degenerate.
+    #[cfg(feature = "std")]
+    fn wrap_minor_once(tree: &mut MerkleTree<NodeAllocator>, region: &MappedRegion, leaf: usize) {
+        const LEAF_SIZE: usize = 0x1000 / NUM_LEAF_NODES;
+
+        for i in 0..=MinorCounter::MAX as u32 {
+            region.fill(leaf * LEAF_SIZE, LEAF_SIZE, (i % 251) as u8);
+            unsafe { tree.rehash(region.byte_ptr(leaf * LEAF_SIZE), LEAF_SIZE) };
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn wrapping_a_minor_counter_starts_a_new_major() {
+        const START: usize = 1 << 42;
+        const SIZE: usize = 0x1000;
+        const LEAF_SIZE: usize = SIZE / NUM_LEAF_NODES;
+
+        let region = MappedRegion::new(START, SIZE);
+        let mut tree = MerkleTree::<NodeAllocator>::constructed(region.base(), SIZE);
+
+        assert_eq!(tree.major, 0);
+        wrap_minor_once(&mut tree, &region, 0);
+
+        // The wrap moved the tree to major 1 and restarted the leaf at 1, so
+        // `(major, minor)` advanced rather than repeating.
+        assert_eq!(tree.major, 1);
+        let leaf = tree.leaf_node(region.byte_ptr(0), LEAF_SIZE).unwrap();
+        assert_eq!(unsafe { leaf.as_ref().minor }, 1);
+
+        // The leaf is still consistent with its memory afterwards.
+        assert!(unsafe { tree.validate(region.byte_ptr(0), LEAF_SIZE) });
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn repeated_writes_of_one_value_never_republish_a_digest() {
+        use std::collections::HashSet;
+
+        const START: usize = 1 << 43;
+        const SIZE: usize = 0x1000;
+        const LEAF_SIZE: usize = SIZE / NUM_LEAF_NODES;
+
+        let region = MappedRegion::new(START, SIZE);
+        let mut tree = MerkleTree::<NodeAllocator>::constructed(region.base(), SIZE);
+
+        // Write one unchanging value over and over, for more than a full lap
+        // of the minor counter. Content is constant, so the published digest
+        // is a pure function of the version — and the version is exactly what
+        // must never repeat. Wrapping the minor without a new major makes the
+        // sequence periodic, which is the replay a version exists to
+        // foreclose.
+        region.fill(0, LEAF_SIZE, 0xa1);
+
+        let laps = 2 * (MinorCounter::MAX as u32 + 1);
+        let mut leaf_digests = HashSet::new();
+        let mut root_digests = HashSet::new();
+
+        for i in 0..laps {
+            unsafe { tree.rehash(region.byte_ptr(0), LEAF_SIZE) };
+
+            let leaf = tree.leaf_node(region.byte_ptr(0), LEAF_SIZE).unwrap();
+            assert!(
+                leaf_digests.insert(unsafe { leaf.as_ref().hash }),
+                "leaf digest repeated on write {i}"
+            );
+            assert!(
+                root_digests.insert(tree.root_digest()),
+                "root digest repeated on write {i}"
+            );
+        }
+
+        // Every write is still consistent with memory at the end of it all.
+        assert!(unsafe { tree.validate(region.byte_ptr(0), LEAF_SIZE) });
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_wrap_re_records_other_leaves_and_leaves_unrecorded_ones_alone() {
+        const START: usize = 1 << 44;
+        const SIZE: usize = 0x1000;
+        const LEAF_SIZE: usize = SIZE / NUM_LEAF_NODES;
+
+        let region = MappedRegion::new(START, SIZE);
+        let mut tree = MerkleTree::<NodeAllocator>::constructed(region.base(), SIZE);
+
+        // A bystander leaf, recorded once under major 0 and never written
+        // again. Its hash was taken against the old major, so the wrap must
+        // recompute it or it would stop validating.
+        region.fill(LEAF_SIZE, LEAF_SIZE, 0xbb);
+        unsafe { tree.rehash(region.byte_ptr(LEAF_SIZE), LEAF_SIZE) };
+        let bystander_hash = unsafe {
+            tree.leaf_node(region.byte_ptr(LEAF_SIZE), LEAF_SIZE)
+                .unwrap()
+                .as_ref()
+                .hash
+        };
+
+        wrap_minor_once(&mut tree, &region, 0);
+
+        let bystander = tree
+            .leaf_node(region.byte_ptr(LEAF_SIZE), LEAF_SIZE)
+            .unwrap();
+        assert_ne!(unsafe { bystander.as_ref().hash }, bystander_hash);
+        assert_eq!(unsafe { bystander.as_ref().minor }, 1);
+        assert!(unsafe { tree.validate(region.byte_ptr(LEAF_SIZE), LEAF_SIZE) });
+
+        // A leaf nothing was ever rehashed through must stay unrecorded — the
+        // wrap must not bless whatever its memory happens to hold.
+        let untouched = tree
+            .leaf_node(region.byte_ptr(SIZE - LEAF_SIZE), LEAF_SIZE)
+            .unwrap();
+        assert_eq!(unsafe { untouched.as_ref().minor }, 0);
+        assert_eq!(unsafe { untouched.as_ref().hash }, [0u8; 32]);
+        assert!(!unsafe { tree.validate(region.byte_ptr(SIZE - LEAF_SIZE), LEAF_SIZE) });
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_wrap_on_a_lazily_built_tree_only_touches_materialized_nodes() {
+        const START: usize = 1 << 45;
+        const SIZE: usize = 0x1000;
+        const LEAF_SIZE: usize = SIZE / NUM_LEAF_NODES;
+
+        let region = MappedRegion::new(START, SIZE);
+        let mut tree = MerkleTree::<NodeAllocator>::empty(region.base(), SIZE);
+
+        // Only one root-to-leaf path exists. The wrap's traversal must not
+        // mistake a half-built inner node for a leaf and hash memory into it.
+        wrap_minor_once(&mut tree, &region, 0);
+
+        assert_eq!(tree.major, 1);
+        assert!(unsafe { tree.validate(region.byte_ptr(0), LEAF_SIZE) });
+
+        let leaf = tree.leaf_node(region.byte_ptr(0), LEAF_SIZE).unwrap();
+        let sibling = unsafe { leaf.as_ref().parent.unwrap().as_ref().right };
+        assert!(sibling.is_none(), "the wrap must not materialize new nodes");
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn root_digest_covers_the_major_counter() {
+        const START: usize = 1 << 41;
+        const SIZE: usize = 0x1000;
+        const LEAF_SIZE: usize = SIZE / NUM_LEAF_NODES;
+
+        let region = MappedRegion::new(START, SIZE);
+        let mut tree = MerkleTree::<NodeAllocator>::constructed(region.base(), SIZE);
+
+        unsafe { tree.rehash(region.byte_ptr(0), LEAF_SIZE) };
+        let digest = tree.root_digest();
+        let root_hash = tree.root_hash();
+
+        // Advancing the major alone leaves every node untouched, so
+        // `root_hash` cannot see it — only `root_digest` can, which is why
+        // that is what a higher level must publish.
+        tree.major += 1;
+        assert_eq!(tree.root_hash(), root_hash);
+        assert_ne!(tree.root_digest(), digest);
     }
 }
